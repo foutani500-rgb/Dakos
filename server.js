@@ -20,7 +20,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, default: 'زائر كريم' },
   gold: { type: Number, default: 1000 },
   diamonds: { type: Number, default: 10 },
-  balance: { type: Number, default: 0 },
+  balance: { type: Number, default: 0 }, // Gram (TON)
   referralCount: { type: Number, default: 0 },
   wheelSpinsLeft: { type: Number, default: 3 },
   createdAt: { type: Date, default: Date.now }
@@ -42,9 +42,9 @@ const Task = mongoose.model('Task', taskSchema);
 
 const promoSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
-  amount: { type: Number, required: true },
-  type: { type: String, required: true },
-  maxUses: { type: Number, default: 100 },
+  totalDiamonds: { type: Number, required: true },
+  totalUsers: { type: Number, required: true },
+  diamondsPerUser: { type: Number, required: true },
   usedCount: { type: Number, default: 0 },
   usedBy: [{ type: String }],
   creatorId: { type: String },
@@ -161,7 +161,34 @@ app.post('/api/user/referral', async (req, res) => {
   }
 });
 
-// 5. التداول المالي
+// 5. التداول المالي (استبدال الذهب بألماس والعكس حسب الواجهة)
+app.post('/api/wallet/exchange', async (req, res) => {
+  try {
+    const { userId, type, amount } = req.body;
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    const val = Number(amount);
+    if (type === 'diamonds_to_gram') {
+      if (user.diamonds < val) return res.status(400).json({ success: false, message: 'رصيد الألماس غير كافٍ' });
+      const gramEarned = val / 500;
+      user.diamonds -= val;
+      user.balance = (user.balance || 0) + gramEarned;
+    } else if (type === 'gold_to_diamonds') {
+      if (user.gold < val) return res.status(400).json({ success: false, message: 'رصيد الذهب غير كافٍ' });
+      const diamondsEarned = Math.floor(val / 200);
+      user.gold -= val;
+      user.diamonds = (user.diamonds || 0) + diamondsEarned;
+    }
+
+    await user.save();
+    res.json({ success: true, message: 'تم التحويل بنجاح', user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في عملية التحويل' });
+  }
+});
+
+// مسارات التداول القديمة للاحتياط
 const handleTrade = async (req, res) => {
   try {
     const { userId, amount } = req.body;
@@ -187,135 +214,142 @@ const handleTrade = async (req, res) => {
     res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
   }
 };
-
 app.post('/api/trading/trade', handleTrade);
 app.post('/api/trade', handleTrade);
 app.post('/api/games/trade', handleTrade);
 
-// 6. التحويل
-const handleTransfer = async (req, res) => {
+// 6. الإيداع والسحب (Wallet Deposit & Withdraw)
+app.post('/api/wallet/deposit', async (req, res) => {
   try {
-    const { userId, recipientId, amount, type } = req.body;
+    const { userId, amount } = req.body;
     let user = await User.findOne({ telegramId: userId });
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (!user) user = new User({ telegramId: userId });
 
-    const transferAmount = Number(amount);
-    const transferType = type || 'gold';
-
-    if (user[transferType] < transferAmount) {
-      return res.status(400).json({ success: false, message: 'رصيدك غير كافي' });
-    }
-
-    if (!recipientId || recipientId === userId) {
-      user[transferType] -= transferAmount;
-      if (transferType === 'gold') {
-        user.diamonds = (user.diamonds || 0) + Math.floor(transferAmount / 100);
-      } else {
-        user.gold = (user.gold || 0) + transferAmount * 100;
-      }
-      await user.save();
-      return res.json({ success: true, message: 'تم التحويل بنجاح', user });
-    }
-
-    let recipient = await User.findOne({ telegramId: recipientId });
-    if (!recipient) recipient = new User({ telegramId: recipientId });
-
-    user[transferType] -= transferAmount;
-    recipient[transferType] = (recipient[transferType] || 0) + transferAmount;
-
+    user.balance = (user.balance || 0) + Number(amount);
     await user.save();
-    await recipient.save();
-
-    res.json({ success: true, message: 'تم التحويل بنجاح', user });
+    res.json({ success: true, message: 'تم الإيداع بنجاح', user });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في عملية التحويل' });
+    res.status(500).json({ success: false, message: 'خطأ في الإيداع' });
   }
-};
+});
 
-app.post('/api/user/transfer', handleTransfer);
-app.post('/api/transfer', handleTransfer);
-app.post('/api/wallet/transfer', handleTransfer);
+app.post('/api/wallet/withdraw', async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+    let user = await User.findOne({ telegramId: userId });
+    if (!user || user.balance < Number(amount)) {
+      return res.status(400).json({ success: false, message: 'رصيد Gram غير كافٍ' });
+    }
 
-// 7. الرموز الترويجية (تفعيل وإنشاء)
+    user.balance -= Number(amount);
+    await user.save();
+    res.json({ success: true, message: 'تم طلب السحب بنجاح', user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في السحب' });
+  }
+});
+
+// 7. الرموز الترويجية للألماس (مطابق تماماً لما ترسله الواجهة)
 app.post('/api/promo/redeem', async (req, res) => {
   try {
     const { userId, code } = req.body;
     if (!code) return res.status(400).json({ success: false, message: 'الرجاء إدخال الرمز' });
 
-    let promo = await Promo.findOne({ code: code.trim() });
+    let promo = await Promo.findOne({ code: code.trim().toUpperCase() });
     if (!promo) return res.status(400).json({ success: false, message: 'الرمز غير صحيح' });
 
     if (promo.usedBy && promo.usedBy.includes(userId)) {
-      return res.status(400).json({ success: false, message: 'استخدمت هذا الرمز مسبقاً' });
+      return res.status(400).json({ success: false, message: 'لقد استخدمت هذا الرمز مسبقاً' });
+    }
+
+    if (promo.usedCount >= promo.totalUsers) {
+      return res.status(400).json({ success: false, message: 'لقد استنفذ هذا الرمز عدد المستخدمين المسموح به' });
     }
 
     let user = await User.findOne({ telegramId: userId });
     if (!user) user = new User({ telegramId: userId });
 
-    user[promo.type] = (user[promo.type] || 0) + promo.amount;
+    // إضافة حصة الألماس للمستخدم
+    const rewardDiamonds = promo.diamondsPerUser;
+    user.diamonds = (user.diamonds || 0) + rewardDiamonds;
+    
     promo.usedCount += 1;
     promo.usedBy.push(userId);
 
     await user.save();
     await promo.save();
 
-    res.json({ success: true, message: 'تم تفعيل الرمز بنجاح', user });
+    // إرجاع الاستجابة بالحقل الذي تنتظره الواجهة بالتحديد: rewardDiamonds
+    res.json({ success: true, rewardDiamonds, user });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'خطأ في تفعيل الرمز' });
   }
 });
 
-// 8. المهام والأدمين وإنشاء الرموز (يدعم الأدمين وأي مستخدم ينشئ رمزه الخاص)
-const ADMIN_ID = "6669520092";
-
-const handleCreatePromo = async (req, res) => {
+// 8. إنشاء رمز ترويجي للألماس من قِبل المستخدم أو الأدمين
+app.post('/api/promo/create', async (req, res) => {
   try {
-    const { adminId, userId, code, amount, type, maxUses } = req.body;
-    const creator = adminId || userId;
-
-    // إذا كان الطلب من الأدمين يتم التحقق من الصلاحية، وإذا كان من مستخدم عادي يُسمح له بخصم رصيده وإنشاء الرمز
-    if (adminId && String(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ success: false, message: 'غير مصرح لك' });
-    }
-
-    if (!code || !amount || !type) {
+    const { userId, code, totalDiamonds, totalUsers, diamondsPerUser } = req.body;
+    if (!code || !totalDiamonds || !totalUsers) {
       return res.status(400).json({ success: false, message: 'بيانات الكود غير مكتملة' });
     }
 
-    const existingPromo = await Promo.findOne({ code: code.trim() });
+    const cleanCode = code.trim().toUpperCase();
+    const existingPromo = await Promo.findOne({ code: cleanCode });
     if (existingPromo) {
       return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
     }
 
-    // إذا كان مستخدماً عادياً يقوم بإنشاء الكود، نخصم المبلغ من رصيده أولاً
-    if (!adminId && userId) {
-      let user = await User.findOne({ telegramId: userId });
-      const totalCost = Number(amount) * (Number(maxUses) || 10);
-      if (!user || user[type] < totalCost) {
-        return res.status(400).json({ success: false, message: 'رصيدك غير كافي لإنشاء الكود' });
+    // خصم الألماس من منشئ الكود إذا لم يكن الأدمين
+    const ADMIN_ID = "6669520092";
+    if (String(userId) !== ADMIN_ID) {
+      let creator = await User.findOne({ telegramId: userId });
+      if (!creator || creator.diamonds < Number(totalDiamonds)) {
+        return res.status(400).json({ success: false, message: 'رصيدك من الألماس لا يكفي لإنشاء هذا الرمز!' });
       }
-      user[type] -= totalCost;
-      await user.save();
+      creator.diamonds -= Number(totalDiamonds);
+      await creator.save();
     }
 
     const newPromo = new Promo({
-      code: code.trim(),
-      amount: Number(amount),
-      type,
-      maxUses: Number(maxUses) || 10,
-      creatorId: creator
+      code: cleanCode,
+      totalDiamonds: Number(totalDiamonds),
+      totalUsers: Number(totalUsers),
+      diamondsPerUser: Number(diamondsPerUser),
+      creatorId: userId
     });
 
     await newPromo.save();
-    res.json({ success: true, message: 'تم إنشاء الكود بنجاح' });
+    res.json({ success: true, message: 'تم إنشاء الرمز بنجاح' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, message: 'فشل إنشاء الكود' });
+    res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
   }
-};
+});
 
-app.post('/api/admin/create-promo', handleCreatePromo);
-app.post('/api/promo/create', handleCreatePromo); // دعم لإنشاء المستخدمين العاديين
+// 9. المهام والأدمين
+app.get('/api/tasks', async (req, res) => {
+  try {
+    const tasks = await Task.find().sort({ createdAt: -1 });
+    res.json(tasks);
+  } catch (err) {
+    res.status(500).json({ error: 'خطأ' });
+  }
+});
+
+app.post('/api/tasks', async (req, res) => {
+  try {
+    const { title, platform, link, target, cost, creatorId } = req.body;
+    const newTask = new Task({ title, platform, link, target, cost, creatorId });
+    await newTask.save();
+    res.status(201).json({ message: 'تم بنجاح', task: newTask });
+  } catch (err) {
+    res.status(500).json({ error: 'فشل' });
+  }
+});
+
+const ADMIN_ID = "6669520092";
 
 app.get('/api/admin/stats', async (req, res) => {
   try {
@@ -344,26 +378,6 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     res.json({ success: true, message: 'تم التعديل' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ' });
-  }
-});
-
-app.get('/api/tasks', async (req, res) => {
-  try {
-    const tasks = await Task.find().sort({ createdAt: -1 });
-    res.json(tasks);
-  } catch (err) {
-    res.status(500).json({ error: 'خطأ' });
-  }
-});
-
-app.post('/api/tasks', async (req, res) => {
-  try {
-    const { title, platform, link, target, cost, creatorId } = req.body;
-    const newTask = new Task({ title, platform, link, target, cost, creatorId });
-    await newTask.save();
-    res.status(201).json({ message: 'تم بنجاح', task: newTask });
-  } catch (err) {
-    res.status(500).json({ error: 'فشل' });
   }
 });
 
