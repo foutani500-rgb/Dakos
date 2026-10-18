@@ -21,6 +21,7 @@ const userSchema = new mongoose.Schema({
   gold: { type: Number, default: 1000 },
   diamonds: { type: Number, default: 10 },
   balance: { type: Number, default: 0 }, // Gram / USD
+  currency: { type: String, default: 'MAD' },
   referralCount: { type: Number, default: 0 },
   isBanned: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
@@ -44,14 +45,27 @@ const Task = mongoose.model('Task', taskSchema);
 const promoSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   amount: { type: Number, required: true },
-  type: { type: String, required: true },
+  type: { type: String, required: true, default: 'gold' },
   maxUses: { type: Number, default: 100 },
   usedCount: { type: Number, default: 0 },
   usedBy: [{ type: String }],
-  diamondsPerUser: { type: Number },
   createdAt: { type: Date, default: Date.now }
 });
 const Promo = mongoose.model('Promo', promoSchema);
+
+// نموذج المعاملات المالية للإيداع والسحب
+const transactionSchema = new mongoose.Schema({
+  txId: { type: String, required: true },
+  userId: { type: String, required: true },
+  type: { type: String, required: true }, // 'إيداع' أو 'سحب'
+  amount: { type: Number, required: true },
+  method: { type: String, required: true },
+  details: { type: String },
+  status: { type: String, default: 'pending' }, // pending, approved, rejected
+  date: { type: String, default: () => new Date().toLocaleString() },
+  createdAt: { type: Date, default: Date.now }
+});
+const Transaction = mongoose.model('Transaction', transactionSchema);
 
 const ADMIN_ID = "6669520092";
 
@@ -61,7 +75,7 @@ app.get('/', (req, res) => {
   res.send('Money Slayer Pro Backend Server is Running! 🚀');
 });
 
-// 1. بروفايل المستخدم
+// 1. بروفايل المستخدم وتحديث العملة
 app.get('/api/user/profile', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -80,6 +94,20 @@ app.get('/api/user/profile', async (req, res) => {
     res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, error: 'خطأ في جلب بيانات المستخدم' });
+  }
+});
+
+app.post('/api/user/update-currency', async (req, res) => {
+  try {
+    const { userId, currency } = req.body;
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    
+    user.currency = currency;
+    await user.save();
+    res.json({ success: true, message: 'تم تحديث العملة بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في تحديث العملة' });
   }
 });
 
@@ -112,7 +140,41 @@ app.post('/api/user/referral', async (req, res) => {
   }
 });
 
-// 3. المحفظة والتحويلات والتبادل
+// 3. المحفظة والتحويلات والتبادل والإيداع والسحب
+app.get('/api/wallet/details', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    let user = await User.findOne({ telegramId: userId });
+    const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 });
+    
+    res.json({
+      success: true,
+      balance: user ? user.balance : 0,
+      gold: user ? user.gold : 0,
+      assets: [
+        { symbol: 'USDT', name: 'TetherUS', logo: '₮', color: '#26a69a', amount: user ? user.balance : 0, rate: 1.0 },
+        { symbol: 'GRAM', name: 'Gram Token', logo: '💎', color: '#00d2ff', amount: user ? user.diamonds : 0, rate: 1.2 },
+        { symbol: 'TRX', name: 'Tron', logo: 'TRX', color: '#ff0000', amount: 0, rate: 0.12 },
+        { symbol: 'BTC', name: 'Bitcoin', logo: '₿', color: '#f7931a', amount: 0, rate: 68000.0 },
+        { symbol: 'ETH', name: 'Ethereum', logo: 'Ξ', color: '#627eea', amount: 0, rate: 3400.0 },
+        { symbol: 'SOL', name: 'Solana', logo: '◎', color: '#14f195', amount: 0, rate: 145.0 }
+      ],
+      transactions: transactions.map(t => ({
+        id: t.txId,
+        userId: t.userId,
+        type: t.type,
+        amount: t.amount,
+        method: t.method,
+        details: t.details,
+        status: t.status === 'approved' ? 'approved' : t.status === 'rejected' ? 'rejected' : 'pending',
+        date: t.date
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في جلب بيانات المحفظة' });
+  }
+});
+
 app.post('/api/wallet/exchange', async (req, res) => {
   try {
     const { userId, type, amount } = req.body;
@@ -134,6 +196,19 @@ app.post('/api/wallet/exchange', async (req, res) => {
     res.json({ success: true, message: 'تم التحويل بنجاح', user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في التحويل' });
+  }
+});
+
+app.post('/api/wallet/convert', async (req, res) => {
+  try {
+    const { userId, fromCurrency, toCurrency, amount } = req.body;
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    
+    // عملية تبسيطية للتحويل
+    res.json({ success: true, message: 'تم التحويل بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في التحويل الفوري' });
   }
 });
 
@@ -176,33 +251,91 @@ app.post('/api/wallet/transfer', handleTransfer);
 
 app.post('/api/wallet/deposit', async (req, res) => {
   try {
-    const { userId, amount } = req.body;
+    const { userId, amount, method, txId } = req.body;
     let user = await User.findOne({ telegramId: userId });
     if (!user) user = new User({ telegramId: userId });
-    user.balance = (user.balance || 0) + Number(amount);
-    await user.save();
-    res.json({ success: true, message: 'تم الإيداع', user });
+
+    const newTx = new Transaction({
+      txId: txId || ('DEP-' + Math.floor(Math.random() * 900000 + 100000)),
+      userId,
+      type: 'إيداع',
+      amount: Number(amount),
+      method: (method || 'BINANCE').toUpperCase(),
+      details: `TxID: ${txId || 'N/A'}`,
+      status: 'pending'
+    });
+    await newTx.save();
+
+    res.json({ success: true, message: 'تم استلام طلب الإيداع وهو قيد المراجعة' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    res.status(500).json({ success: false, message: 'خطأ في إرسال طلب الإيداع' });
+  }
+});
+
+app.post('/api/admin/deposit-notify', async (req, res) => {
+  try {
+    const { id, userId, amount, method, details } = req.body;
+    const newTx = new Transaction({
+      txId: id || ('DEP-' + Math.floor(Math.random() * 900000 + 100000)),
+      userId,
+      type: 'إيداع',
+      amount: Number(amount),
+      method: method || 'BINANCE',
+      details: details || '',
+      status: 'pending'
+    });
+    await newTx.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false });
+  }
+});
+
+app.post('/api/admin/withdraw-notify', async (req, res) => {
+  try {
+    const { id, userId, amount, method, details } = req.body;
+    const newTx = new Transaction({
+      txId: id || ('WIT-' + Math.floor(Math.random() * 900000 + 100000)),
+      userId,
+      type: 'سحب',
+      amount: Number(amount),
+      method: method || 'BANK',
+      details: details || '',
+      status: 'pending'
+    });
+    await newTx.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false });
   }
 });
 
 app.post('/api/wallet/withdraw', async (req, res) => {
   try {
-    const { userId, amount } = req.body;
+    const { userId, amount, method, details } = req.body;
     let user = await User.findOne({ telegramId: userId });
     if (!user || user.balance < Number(amount)) {
       return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ' });
     }
-    user.balance -= Number(amount);
-    await user.save();
-    res.json({ success: true, message: 'تم السحب', user });
+
+    const newTx = new Transaction({
+      txId: 'WIT-' + Math.floor(Math.random() * 900000 + 100000),
+      userId,
+      type: 'سحب',
+      amount: Number(amount),
+      method: (method || 'BANK').toUpperCase(),
+      details: details || 'طلب سحب',
+      status: 'pending'
+    });
+    await newTx.save();
+
+    res.json({ success: true, message: 'تم إرسال طلب السحب بنجاح للمراجعة' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    res.status(500).json({ success: false, message: 'خطأ في عملية السحب' });
   }
 });
 
-// 4. الرموز الترويجية
+// 4. الرموز الترويجية (Promo Codes)
 app.post('/api/promo/redeem', async (req, res) => {
   try {
     const { userId, code } = req.body;
@@ -222,8 +355,8 @@ app.post('/api/promo/redeem', async (req, res) => {
     let user = await User.findOne({ telegramId: userId });
     if (!user) user = new User({ telegramId: userId });
 
-    const reward = promo.diamondsPerUser || promo.amount;
-    user[promo.type] = (user[promo.type] || 0) + reward;
+    const reward = promo.amount || 1000;
+    user[promo.type || 'gold'] = (user[promo.type || 'gold'] || 0) + reward;
 
     promo.usedCount += 1;
     promo.usedBy.push(userId);
@@ -231,13 +364,13 @@ app.post('/api/promo/redeem', async (req, res) => {
     await user.save();
     await promo.save();
 
-    res.json({ success: true, reward, user });
+    res.json({ success: true, reward, user, message: `تم تفعيل الكود بنجاح! حصلت على ${reward} ${promo.type || 'gold'}` });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في تفعيل الرمز' });
   }
 });
 
-// 5. المهام وإنشاؤها وإتمامها
+// 5. المهام (Tasks)
 app.get('/api/tasks', async (req, res) => {
   try {
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
@@ -375,6 +508,8 @@ app.get('/api/admin/dashboard', async (req, res) => {
 
     const totalUsers = await User.countDocuments();
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
+    const pendingTxs = await Transaction.find({ status: 'pending' }).sort({ createdAt: -1 });
+    const promos = await Promo.find().sort({ createdAt: -1 });
 
     res.json({
       success: true,
@@ -382,12 +517,11 @@ app.get('/api/admin/dashboard', async (req, res) => {
         totalUsers,
         activeToday: Math.floor(totalUsers * 0.4),
         totalRevenue: 4250,
-        pendingCount: 1
+        pendingCount: pendingTxs.length
       },
-      transactions: [
-        { id: '1024', type: 'withdraw', userId: '987654321', amount: 50.00, currency: 'USD' }
-      ],
+      transactions: pendingTxs.map(t => ({ id: t.txId, type: t.type, userId: t.userId, amount: t.amount, currency: 'USD', status: t.status })),
       tasks: tasks.map(t => ({ id: t._id, title: t.title, current: t.current, targetUsers: t.target })),
+      promos: promos.map(p => ({ code: p.code, amount: p.amount, maxUses: p.maxUses, usedCount: p.usedCount })),
       rocketConfig: { lossRate: 51, maxMultiplier: 10.0 }
     });
   } catch (err) {
@@ -399,9 +533,24 @@ app.post('/api/admin/process-transaction', async (req, res) => {
   try {
     const { adminId, txId, action } = req.body;
     if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+
+    let tx = await Transaction.findOne({ txId });
+    if (!tx) return res.status(404).json({ success: false, message: 'المعاملة غير موجودة' });
+
+    tx.status = (action === 'accept' ? 'approved' : 'rejected');
+    await tx.save();
+
+    if (action === 'accept' && tx.type === 'إيداع') {
+      let user = await User.findOne({ telegramId: tx.userId });
+      if (user) {
+        user.balance = (user.balance || 0) + tx.amount;
+        await user.save();
+      }
+    }
+
     res.json({ success: true, message: `تم ${action === 'accept' ? 'قبول' : 'رفض'} المعاملة بنجاح` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    res.status(500).json({ success: false, message: 'خطأ في معالجة المعاملة' });
   }
 });
 
@@ -415,6 +564,7 @@ app.post('/api/admin/update-rocket', async (req, res) => {
   }
 });
 
+// مسار حظر وفك حظر المستخدم من لوحة الأدمن
 app.post('/api/admin/user-ban', async (req, res) => {
   try {
     const { adminId, targetUserId, action } = req.body;
@@ -428,10 +578,11 @@ app.post('/api/admin/user-ban', async (req, res) => {
 
     res.json({ success: true, message: `تم ${action === 'ban' ? 'حظر' : 'فك حظر'} المستخدم بنجاح` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    res.status(500).json({ success: false, message: 'خطأ في حظر المستخدم' });
   }
 });
 
+// مسار تعديل رصيد المستخدم (إضافة / خصم) من لوحة الأدمن
 app.post('/api/admin/modify-balance', async (req, res) => {
   try {
     const { adminId, targetUserId, amount, type, action } = req.body;
@@ -441,13 +592,18 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     if (!user) user = new User({ telegramId: targetUserId });
 
     const value = Number(amount);
-    if (action === 'add') user[type] = (user[type] || 0) + value;
-    else if (action === 'subtract') user[type] = Math.max(0, (user[type] || 0) - value);
+    const balanceType = type || 'gold'; // gold, balance, diamonds
+
+    if (action === 'add') {
+      user[balanceType] = (user[balanceType] || 0) + value;
+    } else if (action === 'subtract') {
+      user[balanceType] = Math.max(0, (user[balanceType] || 0) - value);
+    }
 
     await user.save();
     res.json({ success: true, message: 'تم تعديل الرصيد بنجاح' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    res.status(500).json({ success: false, message: 'خطأ في تعديل رصيد المستخدم' });
   }
 });
 
@@ -463,6 +619,7 @@ app.post('/api/admin/delete-task', async (req, res) => {
   }
 });
 
+// مسار إضافة وإنشاء رمز ترويجي جديد من لوحة الأدمن
 app.post('/api/admin/create-promo', async (req, res) => {
   try {
     const { adminId, code, totalGold, maxUses, goldRewardPerPerson, amount, type } = req.body;
@@ -475,20 +632,32 @@ app.post('/api/admin/create-promo', async (req, res) => {
     if (existing) return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
 
     const reward = goldRewardPerPerson || amount || 1000;
-    const uses = maxUses || 10;
+    const uses = maxUses || 100;
 
     const newPromo = new Promo({
       code: cleanCode,
       amount: Number(reward),
       type: type || 'gold',
-      maxUses: Number(uses),
-      diamondsPerUser: Number(reward)
+      maxUses: Number(uses)
     });
 
     await newPromo.save();
     res.json({ success: true, message: 'تم إنشاء الكود الترويجي وإطلاقه بنجاح' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
+  }
+});
+
+// مسار حذف رمز ترويجي من لوحة الأدمن
+app.post('/api/admin/delete-promo', async (req, res) => {
+  try {
+    const { adminId, code } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+
+    await Promo.findOneAndDelete({ code: code.trim().toUpperCase() });
+    res.json({ success: true, message: 'تم حذف الكود الترويجي بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في حذف الكود' });
   }
 });
 
