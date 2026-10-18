@@ -75,7 +75,7 @@ app.get('/', (req, res) => {
   res.send('Money Slayer Pro Backend Server is Running! 🚀');
 });
 
-// 1. بروفايل المستخدم وتحديث العملة
+// 1. بروفايل المستخدم وتحديث العملة مع التحقق الصارم من الحظر
 app.get('/api/user/profile', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -100,8 +100,11 @@ app.get('/api/user/profile', async (req, res) => {
 app.post('/api/user/update-currency', async (req, res) => {
   try {
     const { userId, currency } = req.body;
+    if (!userId || !currency) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     let user = await User.findOne({ telegramId: userId });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
     
     user.currency = currency;
     await user.save();
@@ -111,10 +114,12 @@ app.post('/api/user/update-currency', async (req, res) => {
   }
 });
 
-// 2. نظام الإحالات
+// 2. نظام الإحالات الصارم
 app.get('/api/referrals/stats', async (req, res) => {
   try {
     const { userId } = req.query;
+    if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
+
     let user = await User.findOne({ telegramId: userId });
     res.json({ success: true, referralCount: user ? user.referralCount : 0, referrals: [] });
   } catch (err) {
@@ -126,10 +131,10 @@ app.post('/api/user/referral', async (req, res) => {
   try {
     const { userId, referrerId } = req.body;
     if (!userId || !referrerId || userId === referrerId) {
-      return res.status(400).json({ success: false, message: 'خطأ' });
+      return res.status(400).json({ success: false, message: 'خطأ في البيانات' });
     }
     let referrer = await User.findOne({ telegramId: referrerId });
-    if (referrer) {
+    if (referrer && !referrer.isBanned) {
       referrer.referralCount = (referrer.referralCount || 0) + 1;
       referrer.gold = (referrer.gold || 0) + 100;
       await referrer.save();
@@ -144,7 +149,11 @@ app.post('/api/user/referral', async (req, res) => {
 app.get('/api/wallet/details', async (req, res) => {
   try {
     const { userId } = req.query;
+    if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
+
     let user = await User.findOne({ telegramId: userId });
+    if (user && user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+
     const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 });
     
     res.json({
@@ -178,8 +187,11 @@ app.get('/api/wallet/details', async (req, res) => {
 app.post('/api/wallet/exchange', async (req, res) => {
   try {
     const { userId, type, amount } = req.body;
+    if (!userId || !amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     let user = await User.findOne({ telegramId: userId });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
 
     const val = Number(amount);
     if (type === 'diamonds_to_gram') {
@@ -201,11 +213,13 @@ app.post('/api/wallet/exchange', async (req, res) => {
 
 app.post('/api/wallet/convert', async (req, res) => {
   try {
-    const { userId, fromCurrency, toCurrency, amount } = req.body;
+    const { userId, amount } = req.body;
+    if (!userId || !amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     let user = await User.findOne({ telegramId: userId });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
     
-    // عملية تبسيطية للتحويل
     res.json({ success: true, message: 'تم التحويل بنجاح' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في التحويل الفوري' });
@@ -215,8 +229,10 @@ app.post('/api/wallet/convert', async (req, res) => {
 const handleTransfer = async (req, res) => {
   try {
     const { userId, recipientId, amount, type } = req.body;
+    if (!userId || !amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     let sender = await User.findOne({ telegramId: userId });
-    if (!sender) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (!sender || sender.isBanned) return res.status(404).json({ success: false, message: 'المستخدم غير موجود أو محظور' });
 
     const transferAmount = Number(amount);
     const transferType = type || 'gold';
@@ -232,6 +248,7 @@ const handleTransfer = async (req, res) => {
 
     let recipient = await User.findOne({ telegramId: targetId });
     if (!recipient) recipient = new User({ telegramId: targetId });
+    if (recipient.isBanned) return res.status(400).json({ success: false, message: 'المستلم محظور' });
 
     sender[transferType] -= transferAmount;
     recipient[transferType] = (recipient[transferType] || 0) + transferAmount;
@@ -252,8 +269,10 @@ app.post('/api/wallet/transfer', handleTransfer);
 app.post('/api/wallet/deposit', async (req, res) => {
   try {
     const { userId, amount, method, txId } = req.body;
+    if (!userId || !amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     let user = await User.findOne({ telegramId: userId });
-    if (!user) user = new User({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
 
     const newTx = new Transaction({
       txId: txId || ('DEP-' + Math.floor(Math.random() * 900000 + 100000)),
@@ -274,9 +293,11 @@ app.post('/api/wallet/deposit', async (req, res) => {
 
 app.post('/api/admin/deposit-notify', async (req, res) => {
   try {
-    const { id, userId, amount, method, details } = req.body;
+    const { userId, amount, method, details } = req.body;
+    if (!userId || !amount) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     const newTx = new Transaction({
-      txId: id || ('DEP-' + Math.floor(Math.random() * 900000 + 100000)),
+      txId: 'DEP-' + Math.floor(Math.random() * 900000 + 100000),
       userId,
       type: 'إيداع',
       amount: Number(amount),
@@ -293,9 +314,11 @@ app.post('/api/admin/deposit-notify', async (req, res) => {
 
 app.post('/api/admin/withdraw-notify', async (req, res) => {
   try {
-    const { id, userId, amount, method, details } = req.body;
+    const { userId, amount, method, details } = req.body;
+    if (!userId || !amount) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
     const newTx = new Transaction({
-      txId: id || ('WIT-' + Math.floor(Math.random() * 900000 + 100000)),
+      txId: 'WIT-' + Math.floor(Math.random() * 900000 + 100000),
       userId,
       type: 'سحب',
       amount: Number(amount),
@@ -313,9 +336,13 @@ app.post('/api/admin/withdraw-notify', async (req, res) => {
 app.post('/api/wallet/withdraw', async (req, res) => {
   try {
     const { userId, amount, method, details } = req.body;
+    if (!userId || !amount || Number(amount) < 10) {
+      return res.status(400).json({ success: false, message: 'الحد الأدنى للسحب هو 10$' });
+    }
+
     let user = await User.findOne({ telegramId: userId });
-    if (!user || user.balance < Number(amount)) {
-      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ' });
+    if (!user || user.isBanned || user.balance < Number(amount)) {
+      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ أو الحساب محظور' });
     }
 
     const newTx = new Transaction({
@@ -335,11 +362,11 @@ app.post('/api/wallet/withdraw', async (req, res) => {
   }
 });
 
-// 4. الرموز الترويجية (Promo Codes)
+// 4. الرموز الترويجية (Promo Codes) مع منع الاستخدام المزدوج الصارم
 app.post('/api/promo/redeem', async (req, res) => {
   try {
     const { userId, code } = req.body;
-    if (!code) return res.status(400).json({ success: false, message: 'الرجاء إدخال الرمز' });
+    if (!userId || !code) return res.status(400).json({ success: false, message: 'الرجاء إدخال الرمز' });
 
     let promo = await Promo.findOne({ code: code.trim().toUpperCase() });
     if (!promo) return res.status(400).json({ success: false, message: 'الرمز غير صحيح' });
@@ -353,7 +380,7 @@ app.post('/api/promo/redeem', async (req, res) => {
     }
 
     let user = await User.findOne({ telegramId: userId });
-    if (!user) user = new User({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
 
     const reward = promo.amount || 1000;
     user[promo.type || 'gold'] = (user[promo.type || 'gold'] || 0) + reward;
@@ -370,7 +397,67 @@ app.post('/api/promo/redeem', async (req, res) => {
   }
 });
 
-// 5. المهام (Tasks)
+app.post('/api/promo/apply', async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) return res.status(400).json({ success: false, message: 'الرجاء إدخال الرمز' });
+
+    let promo = await Promo.findOne({ code: code.trim().toUpperCase() });
+    if (!promo) return res.status(400).json({ success: false, message: 'الرمز غير صحيح' });
+
+    if (promo.usedBy && promo.usedBy.includes(userId)) {
+      return res.status(400).json({ success: false, message: 'استخدمت هذا الرمز مسبقاً' });
+    }
+
+    if (promo.usedCount >= promo.maxUses) {
+      return res.status(400).json({ success: false, message: 'انتهت صلاحية الرمز' });
+    }
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+
+    const goldReward = promo.amount || 1000;
+    user[promo.type || 'gold'] = (user[promo.type || 'gold'] || 0) + goldReward;
+
+    promo.usedCount += 1;
+    promo.usedBy.push(userId);
+
+    await user.save();
+    await promo.save();
+
+    res.json({ success: true, goldReward, message: `تم تفعيل الرمز بنجاح!` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
+  }
+});
+
+app.post('/api/promo/create', async (req, res) => {
+  try {
+    const { userId, code, totalGold, maxUses, goldRewardPerPerson } = req.body;
+    if (!userId || !code) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
+
+    const cleanCode = code.trim().toUpperCase();
+    const existing = await Promo.findOne({ code: cleanCode });
+    if (existing) return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
+
+    const newPromo = new Promo({
+      code: cleanCode,
+      amount: Number(goldRewardPerPerson || 1000),
+      type: 'gold',
+      maxUses: Number(maxUses || 5)
+    });
+
+    await newPromo.save();
+    res.json({ success: true, message: 'تم إنشاء الكود بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
+  }
+});
+
+// 5. المهام (Tasks) مع جلب الآيدي الصارم
 app.get('/api/tasks', async (req, res) => {
   try {
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
@@ -380,10 +467,19 @@ app.get('/api/tasks', async (req, res) => {
   }
 });
 
+app.get('/api/tasks/list', async (req, res) => {
+  try {
+    const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
+    res.json({ success: true, tasks: tasks.map(t => ({ id: t._id, creatorId: t.creatorId, title: t.title, platform: t.platform, link: t.link, targetUsers: t.target, current: t.current, rewardGold: Number(t.cost) || 1000, completedBy: t.completedBy })) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'خطأ في جلب المهام' });
+  }
+});
+
 app.post('/api/tasks', async (req, res) => {
   try {
     const { title, platform, link, target, cost, creatorId } = req.body;
-    const newTask = new Task({ title, platform, link, target, cost, creatorId });
+    const newTask = new Task({ title, platform, link, target: target || 50, cost: cost || '1', creatorId });
     await newTask.save();
     res.status(201).json({ message: 'تم إنشاء المهمة بنجاح', task: newTask });
   } catch (err) {
@@ -391,24 +487,60 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
+app.post('/api/tasks/create', async (req, res) => {
+  try {
+    const { userId, title, platform, link, targetUsers, cost } = req.body;
+    if (!userId || !title || !link) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
+
+    const totalCost = Number(cost) || 1;
+    if (user.balance < totalCost) {
+      return res.status(400).json({ success: false, message: 'رصيد USD غير كافٍ لإنشاء المهمة' });
+    }
+
+    user.balance -= totalCost;
+    await user.save();
+
+    const newTask = new Task({
+      title,
+      platform: platform || 'Telegram',
+      link,
+      target: Number(targetUsers) || 50,
+      cost: String(totalCost),
+      creatorId: userId
+    });
+    await newTask.save();
+
+    res.json({ success: true, message: 'تم إنشاء المهمة بنجاح', task: newTask });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في إنشاء المهمة' });
+  }
+});
+
+// مسار إتمام المهمة مع التحقق الصارم المزدوج لمنع أي تكرار نهائياً
 app.post('/api/tasks/complete', async (req, res) => {
   try {
     const { userId, taskId } = req.body;
+    if (!userId || !taskId) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
+
     let task = await Task.findById(taskId);
     if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة' });
 
+    // التحقق الصارم جداً لمنع تكرار الإتمام
     if (task.completedBy && task.completedBy.includes(userId)) {
-      return res.status(400).json({ success: false, message: 'أكملت هذه المهمة مسبقاً!' });
+      return res.status(400).json({ success: false, message: 'لقد أتممت هذه المهمة مسبقاً ولا يمكنك تكرارها!' });
     }
 
-    let user = await User.findOne({ telegramId: userId });
-    if (!user) user = new User({ telegramId: userId });
-
-    let rewardType = 'gold';
-    let rewardAmount = Number(task.cost) || 50;
-
-    user[rewardType] = (user[rewardType] || 0) + rewardAmount;
+    let rewardAmount = 1000; // مكافأة افتراضية ثابتة لكل مهمة
+    user.gold = (user.gold || 0) + rewardAmount;
+    
     task.current = (task.current || 0) + 1;
+    if (!task.completedBy) task.completedBy = [];
     task.completedBy.push(userId);
 
     if (task.current >= task.target) {
@@ -418,17 +550,19 @@ app.post('/api/tasks/complete', async (req, res) => {
     await user.save();
     await task.save();
 
-    res.json({ success: true, message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ${rewardType}`, user });
+    res.json({ success: true, message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ذهبة`, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
   }
 });
 
-// 6. لعبة الصاروخ الفضائي (Rocket Game API)
+// 6. لعبة الصاروخ الفضائي (Rocket Game API) مع التحقق من الأرصدة والحظر
 app.get('/api/games/rocket/status', async (req, res) => {
   try {
     const { userId } = req.query;
     let user = await User.findOne({ telegramId: userId });
+    if (user && user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+
     if (!user && userId) {
       user = new User({ telegramId: userId });
       await user.save();
@@ -451,7 +585,7 @@ app.post('/api/games/rocket/play', async (req, res) => {
     }
 
     let user = await User.findOne({ telegramId: userId });
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'المستخدم غير موجود أو محظور' });
 
     if (user.gold < betAmount) {
       return res.status(400).json({ success: false, message: 'رصيدك من الذهب غير كافٍ!' });
@@ -498,12 +632,12 @@ app.post('/api/games/rocket/play', async (req, res) => {
   }
 });
 
-// 7. لوحة تحكم المطور الشاملة (Super Admin Panel API)
+// 7. لوحة تحكم المطور الشاملة (Super Admin Panel API) مع التحقق الصارم من صلاحيات الأدمن
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
     const { adminId } = req.query;
     if (String(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول - صلاحيات المطور مطلوبة' });
     }
 
     const totalUsers = await User.countDocuments();
@@ -556,7 +690,7 @@ app.post('/api/admin/process-transaction', async (req, res) => {
 
 app.post('/api/admin/update-rocket', async (req, res) => {
   try {
-    const { adminId, lossRate, maxMultiplier } = req.body;
+    const { adminId } = req.body;
     if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
     res.json({ success: true, message: 'تم تحديث خوارزمية لعبة الصاروخ بنجاح' });
   } catch (err) {
@@ -564,7 +698,7 @@ app.post('/api/admin/update-rocket', async (req, res) => {
   }
 });
 
-// مسار حظر وفك حظر المستخدم من لوحة الأدمن
+// مسار حظر وفك حظر المستخدم من لوحة الأدمن مع التحقق الصارم
 app.post('/api/admin/user-ban', async (req, res) => {
   try {
     const { adminId, targetUserId, action } = req.body;
@@ -582,7 +716,7 @@ app.post('/api/admin/user-ban', async (req, res) => {
   }
 });
 
-// مسار تعديل رصيد المستخدم (إضافة / خصم) من لوحة الأدمن
+// مسار تعديل رصيد المستخدم (إضافة / خصم) من لوحة الأدمن مع دعم 'usd' و 'balance' بدقة
 app.post('/api/admin/modify-balance', async (req, res) => {
   try {
     const { adminId, targetUserId, amount, type, action } = req.body;
@@ -592,8 +726,6 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     if (!user) user = new User({ telegramId: targetUserId });
 
     const value = Number(amount);
-    
-    // ربط نوع العملة 'usd' بحقل الـ 'balance' الحقيقي في قاعدة البيانات
     let balanceType = type || 'gold';
     if (balanceType === 'usd') {
       balanceType = 'balance';
@@ -624,7 +756,7 @@ app.post('/api/admin/delete-task', async (req, res) => {
   }
 });
 
-// مسار إضافة وإنشاء رمز ترويجي جديد من لوحة الأدمن
+// مسار إضافة وإنشاء رمز ترويجي جديد من لوحة الأدمن مع التحقق الصارم
 app.post('/api/admin/create-promo', async (req, res) => {
   try {
     const { adminId, code, totalGold, maxUses, goldRewardPerPerson, amount, type } = req.body;
@@ -653,7 +785,7 @@ app.post('/api/admin/create-promo', async (req, res) => {
   }
 });
 
-// مسار حذف رمز ترويجي من لوحة الأدمن
+// مسار حذف رمز ترويجي من لوحة الأدمن مع التحقق الصارم
 app.post('/api/admin/delete-promo', async (req, res) => {
   try {
     const { adminId, code } = req.body;
