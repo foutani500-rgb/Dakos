@@ -75,7 +75,7 @@ app.get('/api/user/profile', async (req, res) => {
   }
 });
 
-// 2. حالة العجلة والألعاب (مطابق لطلب الواجهة)
+// 2. حالة العجلة والألعاب
 app.get('/api/games/status', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -90,7 +90,7 @@ app.get('/api/games/status', async (req, res) => {
   }
 });
 
-// 3. تدوير العجلة (مطابق لطلب الواجهة /api/games/spin)
+// 3. تدوير العجلة مع التحقق من المحاولات وخصمها
 app.post('/api/games/spin', async (req, res) => {
   try {
     const telegramId = req.body.userId || req.body.telegramId;
@@ -100,6 +100,14 @@ app.post('/api/games/spin', async (req, res) => {
     if (!user) {
       user = new User({ telegramId });
     }
+
+    // التحقق من انتهاء المحاولات
+    if (user.wheelSpinsLeft <= 0) {
+      return res.status(400).json({ success: false, message: 'لقد نفذت جميع محاولاتك اليومية!' });
+    }
+
+    // خصم محاولة واحدة
+    user.wheelSpinsLeft -= 1;
 
     const rewards = [
       { type: 'gold', amount: 50 },
@@ -116,7 +124,8 @@ app.post('/api/games/spin', async (req, res) => {
       success: true,
       message: `مبروك! لقد ربحت ${won.amount} من ${won.type}`,
       reward: won,
-      user
+      user,
+      spinsLeft: user.wheelSpinsLeft
     });
   } catch (err) {
     console.error(err);
@@ -124,13 +133,12 @@ app.post('/api/games/spin', async (req, res) => {
   }
 });
 
-// لدعم أي طلب قديم قد يستخدم الرابط القديم أيضاً
 app.post('/api/wheel/spin', async (req, res) => {
   req.url = '/api/games/spin';
   return app._router.handle(req, res);
 });
 
-// 4. إحصائيات الإحالات (مطابق لطلب الواجهة /api/referrals/stats)
+// 4. إحصائيات الإحالات
 app.get('/api/referrals/stats', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -145,7 +153,6 @@ app.get('/api/referrals/stats', async (req, res) => {
   }
 });
 
-// تسجيل إحالة جديدة
 app.post('/api/user/referral', async (req, res) => {
   try {
     const { userId, referrerId } = req.body;
@@ -193,32 +200,43 @@ app.post('/api/trading/trade', async (req, res) => {
   }
 });
 
-// 6. التحويل بين المستخدمين
-app.post('/api/user/transfer', async (req, res) => {
+// 6. التحويل بين المستخدمين (دعم لجميع صيغ الروابط المحتملة لتجنب 404)
+const handleTransfer = async (req, res) => {
   try {
     const { userId, recipientId, amount, type } = req.body;
-    let sender = await User.findOne({ telegramId: userId });
-    let recipient = await User.findOne({ telegramId: recipientId });
+    if (!userId || !amount) {
+      return res.status(400).json({ success: false, message: 'بيانات التحويل غير مكتملة' });
+    }
 
-    if (!sender || sender[type] < Number(amount)) {
+    let sender = await User.findOne({ telegramId: userId });
+    const targetId = recipientId || req.body.toUserId || req.body.receiverId;
+    let recipient = await User.findOne({ telegramId: targetId });
+
+    const transferType = type || 'gold';
+    if (!sender || sender[transferType] < Number(amount)) {
       return res.status(400).json({ success: false, message: 'رصيدك غير كافي للتحويل' });
     }
 
     if (!recipient) {
-      recipient = new User({ telegramId: recipientId });
+      recipient = new User({ telegramId: targetId || '123456' });
     }
 
-    sender[type] -= Number(amount);
-    recipient[type] = (recipient[type] || 0) + Number(amount);
+    sender[transferType] -= Number(amount);
+    recipient[transferType] = (recipient[transferType] || 0) + Number(amount);
 
     await sender.save();
     await recipient.save();
 
     res.json({ success: true, message: 'تم التحويل بنجاح', sender });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'خطأ في التحويل' });
   }
-});
+};
+
+app.post('/api/user/transfer', handleTransfer);
+app.post('/api/transfer', handleTransfer);
+app.post('/api/wallet/transfer', handleTransfer);
 
 // 7. الرموز الترويجية
 app.post('/api/promo/redeem', async (req, res) => {
