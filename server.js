@@ -83,10 +83,73 @@ app.get('/api/user/profile', async (req, res) => {
   }
 });
 
-// 3. مسارات الألعاب وعجلة الحظ (Wheel / Games)
+// 3. مسار تفعيل الرمز الترويجي (Promo Code Redeem) - لحل مشكلة الخطأ الأخيرة
+app.post('/api/promo/redeem', async (req, res) => {
+  try {
+    const { userId, code } = req.body;
+    if (!userId || !code) {
+      return res.status(400).json({ success: false, message: 'الرجاء إدخال الرمز' });
+    }
+
+    let promo = await Promo.findOne({ code: code.trim() });
+    if (!promo) {
+      return res.status(400).json({ success: false, message: 'الرمز الترويجي غير صحيح' });
+    }
+
+    if (promo.usedBy && promo.usedBy.includes(userId)) {
+      return res.status(400).json({ success: false, message: 'لقد قمت باستخدام هذا الرمز مسبقاً' });
+    }
+
+    if (promo.usedCount >= promo.maxUses) {
+      return res.status(400).json({ success: false, message: 'لقد انتهت صلاحية هذا الرمز' });
+    }
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) {
+      user = new User({ telegramId: userId });
+    }
+
+    const rewardType = promo.type || 'gold';
+    user[rewardType] = (user[rewardType] || 0) + promo.amount;
+    
+    promo.usedCount += 1;
+    promo.usedBy.push(userId);
+
+    await user.save();
+    await promo.save();
+
+    res.json({ success: true, message: `تم تفعيل الرمز بنجاح! حصلت على ${promo.amount} من ${rewardType}`, user });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'خطأ في السيرفر أثناء تفعيل الرمز' });
+  }
+});
+
+// 4. مسار تسجيل الإحالات (Referrals)
+app.post('/api/user/referral', async (req, res) => {
+  try {
+    const { userId, referrerId } = req.body;
+    if (!userId || !referrerId || userId === referrerId) {
+      return res.status(400).json({ success: false, message: 'بيانات الإحالة غير صالحة' });
+    }
+
+    let referrer = await User.findOne({ telegramId: referrerId });
+    if (referrer) {
+      referrer.referralCount = (referrer.referralCount || 0) + 1;
+      referrer.gold = (referrer.gold || 0) + 100;
+      await referrer.save();
+    }
+
+    res.json({ success: true, message: 'تم احتساب الإحالة بنجاح' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'خطأ في تسجيل الإحالة' });
+  }
+});
+
+// 5. مسارات الألعاب وعجلة الحظ (Wheel / Games)
 app.post('/api/wheel/spin', async (req, res) => {
   try {
-    const { userId } جائزة = req.body; // دعم لاستلام المعرف
     const telegramId = req.body.userId || req.body.telegramId;
     
     if (!telegramId) return res.status(400).json({ success: false, message: 'Missing userId' });
@@ -96,7 +159,6 @@ app.post('/api/wheel/spin', async (req, res) => {
       user = new User({ telegramId });
     }
 
-    // منح جائزة عشوائية عند تدوير العجلة (مثلاً: 50 ذهبة أو 5 ألماسات)
     const rewards = [
       { type: 'gold', amount: 50 },
       { type: 'gold', amount: 100 },
@@ -120,10 +182,10 @@ app.post('/api/wheel/spin', async (req, res) => {
   }
 });
 
-// 4. مسار صالة التداول (Trading)
+// 6. مسار صالة التداول (Trading)
 app.post('/api/trading/trade', async (req, res) => {
   try {
-    const { userId, amount, type } = req.body;
+    const { userId, amount } = req.body;
     if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
 
     let user = await User.findOne({ telegramId: userId });
@@ -134,7 +196,6 @@ app.post('/api/trading/trade', async (req, res) => {
       return res.status(400).json({ success: false, message: 'رصيدك من الذهب لا يكفي للتداول' });
     }
 
-    // محاكاة نتيجة التداول (ربح أو خسارة عشوائية)
     const isWin = Math.random() >= 0.5;
     if (isWin) {
       user.gold += tradeAmount * 0.5;
@@ -151,7 +212,7 @@ app.post('/api/trading/trade', async (req, res) => {
   }
 });
 
-// 5. مسار تحويل الرصيد (Transfer)
+// 7. مسار تحويل الرصيد (Transfer)
 app.post('/api/user/transfer', async (req, res) => {
   try {
     const { userId, recipientId, amount, type } = req.body;
@@ -183,10 +244,9 @@ app.post('/api/user/transfer', async (req, res) => {
   }
 });
 
-// 6. مسارات الأدمين (Admin Endpoints)
+// 8. مسارات الأدمين (Admin Endpoints)
 const ADMIN_ID = "6669520092";
 
-// أ) إحصائيات لوحة التحكم
 app.get('/api/admin/stats', async (req, res) => {
   try {
     const { adminId } = req.query;
@@ -207,7 +267,6 @@ app.get('/api/admin/stats', async (req, res) => {
   }
 });
 
-// ب) تعديل أرصدة المستخدمين (إضافة أو خصم)
 app.post('/api/admin/modify-balance', async (req, res) => {
   try {
     const { adminId, targetUserId, amount, type, action } = req.body;
@@ -236,7 +295,6 @@ app.post('/api/admin/modify-balance', async (req, res) => {
   }
 });
 
-// ج) إنشاء رمز ترويجي جديد (Promo Code)
 app.post('/api/admin/create-promo', async (req, res) => {
   try {
     const { adminId, code, amount, type, maxUses } = req.body;
