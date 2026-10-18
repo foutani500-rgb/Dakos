@@ -22,10 +22,12 @@ mongoose.connect(MONGO_URI)
 const userSchema = new mongoose.Schema({
   telegramId: { type: String, required: true, unique: true },
   name: { type: String, default: 'زائر كريم' },
-  gold: { type: Number, default: 0 },
-  diamonds: { type: Number, default: 0 },
+  gold: { type: Number, default: 1000 },
+  diamonds: { type: Number, default: 10 },
   balance: { type: Number, default: 0 },
   referralCount: { type: Number, default: 0 },
+  lastWheelSpin: { type: Date },
+  wheelSpinsLeft: { type: Number, default: 3 },
   createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -81,7 +83,107 @@ app.get('/api/user/profile', async (req, res) => {
   }
 });
 
-// 3. مسارات الأدمين (Admin Endpoints)
+// 3. مسارات الألعاب وعجلة الحظ (Wheel / Games)
+app.post('/api/wheel/spin', async (req, res) => {
+  try {
+    const { userId } جائزة = req.body; // دعم لاستلام المعرف
+    const telegramId = req.body.userId || req.body.telegramId;
+    
+    if (!telegramId) return res.status(400).json({ success: false, message: 'Missing userId' });
+
+    let user = await User.findOne({ telegramId });
+    if (!user) {
+      user = new User({ telegramId });
+    }
+
+    // منح جائزة عشوائية عند تدوير العجلة (مثلاً: 50 ذهبة أو 5 ألماسات)
+    const rewards = [
+      { type: 'gold', amount: 50 },
+      { type: 'gold', amount: 100 },
+      { type: 'diamonds', amount: 2 },
+      { type: 'balance', amount: 1 }
+    ];
+    const won = rewards[Math.floor(Math.random() * rewards.length)];
+
+    user[won.type] = (user[won.type] || 0) + won.amount;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `مبروك! لقد ربحت ${won.amount} من ${won.type}`,
+      reward: won,
+      user
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'خطأ في تشغيل عجلة الحظ' });
+  }
+});
+
+// 4. مسار صالة التداول (Trading)
+app.post('/api/trading/trade', async (req, res) => {
+  try {
+    const { userId, amount, type } = req.body;
+    if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    const tradeAmount = Number(amount) || 10;
+    if (user.gold < tradeAmount) {
+      return res.status(400).json({ success: false, message: 'رصيدك من الذهب لا يكفي للتداول' });
+    }
+
+    // محاكاة نتيجة التداول (ربح أو خسارة عشوائية)
+    const isWin = Math.random() >= 0.5;
+    if (isWin) {
+      user.gold += tradeAmount * 0.5;
+      await user.save();
+      return res.json({ success: true, message: 'صفقة ناجحة! ربحت أرباح إضافية', user, profit: tradeAmount * 0.5 });
+    } else {
+      user.gold -= tradeAmount;
+      await user.save();
+      return res.json({ success: true, message: 'للأسف خسرت الصفقة', user, loss: tradeAmount });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'خطأ في تنفيذ عملية التداول' });
+  }
+});
+
+// 5. مسار تحويل الرصيد (Transfer)
+app.post('/api/user/transfer', async (req, res) => {
+  try {
+    const { userId, recipientId, amount, type } = req.body;
+    if (!userId || !recipientId || !amount) {
+      return res.status(400).json({ success: false, message: 'بيانات التحويل غير مكتملة' });
+    }
+
+    let sender = await User.findOne({ telegramId: userId });
+    let recipient = await User.findOne({ telegramId: recipientId });
+
+    if (!sender || sender[type] < Number(amount)) {
+      return res.status(400).json({ success: false, message: 'رصيدك غير كافي للتحويل' });
+    }
+
+    if (!recipient) {
+      recipient = new User({ telegramId: recipientId });
+    }
+
+    sender[type] -= Number(amount);
+    recipient[type] = (recipient[type] || 0) + Number(amount);
+
+    await sender.save();
+    await recipient.save();
+
+    res.json({ success: true, message: 'تم التحويل بنجاح', sender });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'خطأ في عملية التحويل' });
+  }
+});
+
+// 6. مسارات الأدمين (Admin Endpoints)
 const ADMIN_ID = "6669520092";
 
 // أ) إحصائيات لوحة التحكم
@@ -97,7 +199,7 @@ app.get('/api/admin/stats', async (req, res) => {
       success: true,
       stats: {
         totalUsers: totalUsers,
-        activeToday: totalUsers // افتراضي أو حسب آخر نشاط
+        activeToday: totalUsers
       }
     });
   } catch (err) {
@@ -116,7 +218,6 @@ app.post('/api/admin/modify-balance', async (req, res) => {
 
     let user = await User.findOne({ telegramId: targetUserId });
     if (!user) {
-      // إذا لم يكن المستخدم مسجلاً بعد، نقوم بإنشائه تلقائياً
       user = new User({ telegramId: targetUserId });
     }
 
@@ -164,7 +265,7 @@ app.post('/api/admin/create-promo', async (req, res) => {
   }
 });
 
-// --- مسارات المهام التقليدية ---
+// --- مسارات المهام ---
 app.get('/api/tasks', async (req, res) => {
   try {
     const tasks = await Task.find().sort({ createdAt: -1 });
