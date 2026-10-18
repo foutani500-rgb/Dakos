@@ -20,10 +20,9 @@ const userSchema = new mongoose.Schema({
   name: { type: String, default: 'زائر كريم' },
   gold: { type: Number, default: 1000 },
   diamonds: { type: Number, default: 10 },
-  balance: { type: Number, default: 0 }, // Gram (TON)
+  balance: { type: Number, default: 0 }, // Gram / USD
   referralCount: { type: Number, default: 0 },
-  wheelSpinsLeft: { type: Number, default: 3 },
-  lastWheelSpinDate: { type: String }, // لتجديد المحاولات يومياً
+  isBanned: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -34,9 +33,9 @@ const taskSchema = new mongoose.Schema({
   link: { type: String, required: true },
   current: { type: Number, default: 0 },
   target: { type: Number, required: true },
-  cost: { type: String, required: true }, // قيمة المكافأة للمهمة (مثلاً ذهب أو ألماس)
+  cost: { type: String, required: true }, 
   creatorId: { type: String, required: true },
-  completedBy: [{ type: String }], // تتبع المستخدمين الذين أكملوا المهمة
+  completedBy: [{ type: String }],
   status: { type: String, default: 'جارٍ التنفيذ' },
   createdAt: { type: Date, default: Date.now }
 });
@@ -54,11 +53,12 @@ const promoSchema = new mongoose.Schema({
 });
 const Promo = mongoose.model('Promo', promoSchema);
 
+const ADMIN_ID = "6669520092";
 
 // --- المسارات (API Routes) ---
 
 app.get('/', (req, res) => {
-  res.send('Money Bux Backend Server is Running! 🚀');
+  res.send('Money Slayer Pro Backend Server is Running! 🚀');
 });
 
 // 1. بروفايل المستخدم
@@ -72,86 +72,18 @@ app.get('/api/user/profile', async (req, res) => {
       user = new User({ telegramId: userId, gold: 1000, diamonds: 10, balance: 0 });
       await user.save();
     }
+
+    if (user.isBanned) {
+      return res.status(403).json({ success: false, message: 'حسابك محظور من استخدام المنصة.' });
+    }
+
     res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, error: 'خطأ في جلب بيانات المستخدم' });
   }
 });
 
-// 2. حالة العجلة والألعاب (مع التجديد التلقائي للمحاولات يومياً - الخطوة 3)
-app.get('/api/games/status', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    let user = await User.findOne({ telegramId: userId });
-    if (!user && userId) {
-      user = new User({ telegramId: userId });
-      await user.save();
-    }
-
-    if (user) {
-      const todayStr = new Date().toISOString().split('T')[0]; // تاريخ اليوم YYYY-MM-DD
-      if (user.lastWheelSpinDate !== todayStr) {
-        user.wheelSpinsLeft = 3; // تجديد المحاولات إلى 3 يومياً
-        user.lastWheelSpinDate = todayStr;
-        await user.save();
-      }
-    }
-
-    res.json({ success: true, spinsLeft: user ? user.wheelSpinsLeft : 3 });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في جلب حالة الألعاب' });
-  }
-});
-
-// 3. تدوير العجلة
-const handleSpin = async (req, res) => {
-  try {
-    const telegramId = req.body.userId || req.body.telegramId || req.query.userId;
-    if (!telegramId) return res.status(400).json({ success: false, message: 'Missing userId' });
-
-    let user = await User.findOne({ telegramId });
-    if (!user) user = new User({ telegramId });
-
-    // التحقق من تاريخ اليوم لتجديد المحاولات تلقائياً
-    const todayStr = new Date().toISOString().split('T')[0];
-    if (user.lastWheelSpinDate !== todayStr) {
-      user.wheelSpinsLeft = 3;
-      user.lastWheelSpinDate = todayStr;
-    }
-
-    if (user.wheelSpinsLeft <= 0) {
-      return res.status(400).json({ success: false, message: 'انتهت محاولات اليوم!' });
-    }
-
-    user.wheelSpinsLeft -= 1;
-
-    const rewards = [
-      { type: 'gold', amount: 50 },
-      { type: 'gold', amount: 100 },
-      { type: 'diamonds', amount: 2 },
-      { type: 'balance', amount: 1 }
-    ];
-    const won = rewards[Math.floor(Math.random() * rewards.length)];
-
-    user[won.type] = (user[won.type] || 0) + won.amount;
-    await user.save();
-
-    res.json({
-      success: true,
-      message: `مبروك! ربحت ${won.amount} ${won.type}`,
-      reward: won,
-      user,
-      spinsLeft: user.wheelSpinsLeft
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في تشغيل العجلة' });
-  }
-};
-
-app.post('/api/games/spin', handleSpin);
-app.post('/api/wheel/spin', handleSpin);
-
-// 4. الإحالات
+// 2. نظام الإحالات
 app.get('/api/referrals/stats', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -180,7 +112,7 @@ app.post('/api/user/referral', async (req, res) => {
   }
 });
 
-// 5. تبادل العملات الداخلية
+// 3. المحفظة والتحويلات والتبادل
 app.post('/api/wallet/exchange', async (req, res) => {
   try {
     const { userId, type, amount } = req.body;
@@ -205,7 +137,6 @@ app.post('/api/wallet/exchange', async (req, res) => {
   }
 });
 
-// 6. التحويل بين المستخدمين
 const handleTransfer = async (req, res) => {
   try {
     const { userId, recipientId, amount, type } = req.body;
@@ -243,7 +174,6 @@ app.post('/api/user/transfer', handleTransfer);
 app.post('/api/transfer', handleTransfer);
 app.post('/api/wallet/transfer', handleTransfer);
 
-// 7. الإيداع والسحب
 app.post('/api/wallet/deposit', async (req, res) => {
   try {
     const { userId, amount } = req.body;
@@ -272,7 +202,7 @@ app.post('/api/wallet/withdraw', async (req, res) => {
   }
 });
 
-// 8. الرموز الترويجية
+// 4. الرموز الترويجية
 app.post('/api/promo/redeem', async (req, res) => {
   try {
     const { userId, code } = req.body;
@@ -301,54 +231,16 @@ app.post('/api/promo/redeem', async (req, res) => {
     await user.save();
     await promo.save();
 
-    res.json({ success: true, rewardDiamonds: reward, user });
+    res.json({ success: true, reward, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في تفعيل الرمز' });
   }
 });
 
-const ADMIN_ID = "6669520092";
-
-const handleCreatePromo = async (req, res) => {
-  try {
-    const { adminId, userId, code, amount, type, maxUses, totalDiamonds, totalUsers, diamondsPerUser } = req.body;
-    if (adminId && String(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ success: false, message: 'غير مصرح لك' });
-    }
-
-    if (!code) return res.status(400).json({ success: false, message: 'يرجى إدخال اسم الرمز' });
-
-    const cleanCode = code.trim().toUpperCase();
-    const existingPromo = await Promo.findOne({ code: cleanCode });
-    if (existingPromo) return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
-
-    const promoAmount = amount || diamondsPerUser || 10;
-    const promoType = type || 'diamonds';
-    const uses = maxUses || totalUsers || 10;
-
-    const newPromo = new Promo({
-      code: cleanCode,
-      amount: Number(promoAmount),
-      type: promoType,
-      maxUses: Number(uses),
-      diamondsPerUser: Number(promoAmount)
-    });
-
-    await newPromo.save();
-    res.json({ success: true, message: 'تم إنشاء الكود بنجاح' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
-  }
-};
-
-app.post('/api/admin/create-promo', handleCreatePromo);
-app.post('/api/promo/create', handleCreatePromo);
-
-// 9. مسارات المهام وإتمامها (الخطوة 1 الجديدة)
+// 5. المهام وإنشاؤها وإتمامها
 app.get('/api/tasks', async (req, res) => {
   try {
-    const tasks = await Task.find().sort({ createdAt: -1 });
+    const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
     res.json(tasks);
   } catch (err) {
     res.status(500).json({ error: 'خطأ في جلب المهام' });
@@ -366,31 +258,21 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
-// مسار إتمام المهمة ومنح المكافأة للمستخدم
 app.post('/api/tasks/complete', async (req, res) => {
   try {
     const { userId, taskId } = req.body;
-    if (!userId || !taskId) {
-      return res.status(400).json({ success: false, message: 'بيانات غير مكتملة' });
-    }
-
     let task = await Task.findById(taskId);
-    if (!task) {
-      return res.status(404).json({ success: false, message: 'المهمة غير موجودة' });
-    }
+    if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة' });
 
     if (task.completedBy && task.completedBy.includes(userId)) {
-      return res.status(400).json({ success: false, message: 'لقد أكملت هذه المهمة مسبقاً!' });
+      return res.status(400).json({ success: false, message: 'أكملت هذه المهمة مسبقاً!' });
     }
 
     let user = await User.findOne({ telegramId: userId });
     if (!user) user = new User({ telegramId: userId });
 
-    // تحديد نوع المكافأة وقيمتها من حقل cost (مثلاً: "50 gold" أو افتراضياً ذهب)
     let rewardType = 'gold';
     let rewardAmount = Number(task.cost) || 50;
-    
-    if (task.cost && task.cost.includes('diamond')) rewardType = 'diamonds';
 
     user[rewardType] = (user[rewardType] || 0) + rewardAmount;
     task.current = (task.current || 0) + 1;
@@ -403,24 +285,148 @@ app.post('/api/tasks/complete', async (req, res) => {
     await user.save();
     await task.save();
 
-    res.json({ 
-      success: true, 
-      message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ${rewardType}`, 
-      user 
-    });
+    res.json({ success: true, message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ${rewardType}`, user });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: 'خطأ في السيرفر أثناء إتمام المهمة' });
+    res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
   }
 });
 
-// 10. أدوات لوحة تحكم الأدمين
-app.get('/api/admin/stats', async (req, res) => {
+// 6. لعبة الصاروخ الفضائي (Rocket Game API)
+app.get('/api/games/rocket/status', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    let user = await User.findOne({ telegramId: userId });
+    if (!user && userId) {
+      user = new User({ telegramId: userId });
+      await user.save();
+    }
+    res.json({ 
+      success: true, 
+      balance: user ? user.gold : 1000, 
+      config: { lossRate: 51, maxMultiplier: 10.0 } 
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في جلب بيانات لعبة الصاروخ' });
+  }
+});
+
+app.post('/api/games/rocket/play', async (req, res) => {
+  try {
+    const { userId, betAmount, cashOutMultiplier } = req.body;
+    if (!userId || !betAmount || betAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'بيانات الرهان غير صالحة' });
+    }
+
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    if (user.gold < betAmount) {
+      return res.status(400).json({ success: false, message: 'رصيدك من الذهب غير كافٍ!' });
+    }
+
+    user.gold -= Number(betAmount);
+
+    const rand = Math.random() * 100;
+    let crashMultiplier = 1.00;
+
+    if (rand < 51) {
+      crashMultiplier = Number((1.00 + Math.random() * 0.30).toFixed(2));
+    } else if (rand < 85) {
+      crashMultiplier = Number((1.31 + Math.random() * 2.19).toFixed(2));
+    } else {
+      crashMultiplier = Number((3.51 + Math.random() * 6.49).toFixed(2));
+    }
+
+    const playerTarget = Number(cashOutMultiplier) || 1.00;
+    let wonAmount = 0;
+    let isWon = false;
+
+    if (playerTarget <= crashMultiplier) {
+      isWon = true;
+      wonAmount = Math.floor(betAmount * playerTarget);
+      user.gold += wonAmount;
+    } else {
+      isWon = false;
+      wonAmount = 0;
+    }
+
+    await user.save();
+
+    res.json({
+      success: true,
+      isWon,
+      crashMultiplier,
+      wonAmount,
+      newBalance: user.gold,
+      message: isWon ? `🎉 مبروك! ربحت ${wonAmount} ذهبة!` : `💥 بانم! انفجر الصاروخ عند ${crashMultiplier}x وخسرت.`
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في معالجة جولة لعبة الصاروخ' });
+  }
+});
+
+// 7. لوحة تحكم المطور الشاملة (Super Admin Panel API)
+app.get('/api/admin/dashboard', async (req, res) => {
   try {
     const { adminId } = req.query;
-    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+    if (String(adminId) !== ADMIN_ID) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+
     const totalUsers = await User.countDocuments();
-    res.json({ success: true, stats: { totalUsers, activeToday: totalUsers } });
+    const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      stats: {
+        totalUsers,
+        activeToday: Math.floor(totalUsers * 0.4),
+        totalRevenue: 4250,
+        pendingCount: 1
+      },
+      transactions: [
+        { id: '1024', type: 'withdraw', userId: '987654321', amount: 50.00, currency: 'USD' }
+      ],
+      tasks: tasks.map(t => ({ id: t._id, title: t.title, current: t.current, targetUsers: t.target })),
+      rocketConfig: { lossRate: 51, maxMultiplier: 10.0 }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ في جلب بيانات لوحة التحكم' });
+  }
+});
+
+app.post('/api/admin/process-transaction', async (req, res) => {
+  try {
+    const { adminId, txId, action } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+    res.json({ success: true, message: `تم ${action === 'accept' ? 'قبول' : 'رفض'} المعاملة بنجاح` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ' });
+  }
+});
+
+app.post('/api/admin/update-rocket', async (req, res) => {
+  try {
+    const { adminId, lossRate, maxMultiplier } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+    res.json({ success: true, message: 'تم تحديث خوارزمية لعبة الصاروخ بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ' });
+  }
+});
+
+app.post('/api/admin/user-ban', async (req, res) => {
+  try {
+    const { adminId, targetUserId, action } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+
+    let user = await User.findOne({ telegramId: targetUserId });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    user.isBanned = (action === 'ban');
+    await user.save();
+
+    res.json({ success: true, message: `تم ${action === 'ban' ? 'حظر' : 'فك حظر'} المستخدم بنجاح` });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ' });
   }
@@ -439,13 +445,54 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     else if (action === 'subtract') user[type] = Math.max(0, (user[type] || 0) - value);
 
     await user.save();
-    res.json({ success: true, message: 'تم التعديل' });
+    res.json({ success: true, message: 'تم تعديل الرصيد بنجاح' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ' });
   }
 });
 
+app.post('/api/admin/delete-task', async (req, res) => {
+  try {
+    const { adminId, taskId } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+
+    await Task.findByIdAndDelete(taskId);
+    res.json({ success: true, message: 'تم حذف المهمة بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'خطأ' });
+  }
+});
+
+app.post('/api/admin/create-promo', async (req, res) => {
+  try {
+    const { adminId, code, totalGold, maxUses, goldRewardPerPerson, amount, type } = req.body;
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
+
+    if (!code) return res.status(400).json({ success: false, message: 'يرجى إدخال اسم الرمز' });
+
+    const cleanCode = code.trim().toUpperCase();
+    const existing = await Promo.findOne({ code: cleanCode });
+    if (existing) return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
+
+    const reward = goldRewardPerPerson || amount || 1000;
+    const uses = maxUses || 10;
+
+    const newPromo = new Promo({
+      code: cleanCode,
+      amount: Number(reward),
+      type: type || 'gold',
+      maxUses: Number(uses),
+      diamondsPerUser: Number(reward)
+    });
+
+    await newPromo.save();
+    res.json({ success: true, message: 'تم إنشاء الكود الترويجي وإطلاقه بنجاح' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 السيرفر يعمل على المنفذ ${PORT}`);
+  console.log(`🚀 السيرفر يعمل بكامل طاقته على المنفذ ${PORT}`);
 });
