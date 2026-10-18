@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // الاتصال بقاعدة بيانات MongoDB Atlas
-const MONGO_URI = process.env.MONGO_URI || 'ضع_رابط_قاعدة_البيانات_هنا';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://mohamedfoutani10k_db_user:dakos2004@moneybuxdb.q4kojcz.mongodb.net/?retryWrites=true&w=majority';
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ تم الاتصال بقاعدة بيانات MongoDB Atlas بنجاح'))
@@ -64,7 +64,7 @@ app.get('/', (req, res) => {
   res.send('Money Bux Backend Server is Running! 🚀');
 });
 
-// 2. جلب بروفایل المستخدم
+// 2. جلب بروفايل المستخدم
 app.get('/api/user/profile', async (req, res) => {
   try {
     const { userId } = req.query;
@@ -146,7 +146,7 @@ app.post('/api/admin/create-promo', async (req, res) => {
 
     const existingPromo = await Promo.findOne({ code });
     if (existingPromo) {
-      return.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
+      return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
     }
 
     const newPromo = new Promo({
