@@ -592,7 +592,12 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     if (!user) user = new User({ telegramId: targetUserId });
 
     const value = Number(amount);
-    const balanceType = type || 'gold'; // gold, balance, diamonds
+    
+    // ربط نوع العملة 'usd' بحقل الـ 'balance' الحقيقي في قاعدة البيانات
+    let balanceType = type || 'gold';
+    if (balanceType === 'usd') {
+      balanceType = 'balance';
+    }
 
     if (action === 'add') {
       user[balanceType] = (user[balanceType] || 0) + value;
@@ -601,7 +606,7 @@ app.post('/api/admin/modify-balance', async (req, res) => {
     }
 
     await user.save();
-    res.json({ success: true, message: 'تم تعديل الرصيد بنجاح' });
+    res.json({ success: true, message: 'تم تعديل الرصيد بنجاح', user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في تعديل رصيد المستخدم' });
   }
