@@ -470,7 +470,7 @@ app.get('/api/tasks', async (req, res) => {
 app.get('/api/tasks/list', async (req, res) => {
   try {
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
-    res.json({ success: true, tasks: tasks.map(t => ({ id: t._id, creatorId: t.creatorId, title: t.title, platform: t.platform, link: t.link, targetUsers: t.target, current: t.current, rewardGold: Number(t.cost) || 1000, completedBy: t.completedBy })) });
+    res.json({ success: true, tasks: tasks.map(t => ({ id: t._id, creatorId: t.creatorId, title: t.title, platform: t.platform, link: t.link, targetUsers: t.target, current: t.current, rewardGold: 1000, completedBy: t.completedBy })) });
   } catch (err) {
     res.status(500).json({ success: false, error: 'خطأ في جلب المهام' });
   }
@@ -519,11 +519,16 @@ app.post('/api/tasks/create', async (req, res) => {
   }
 });
 
-// مسار إتمام المهمة مع التحقق الصارم المزدوج لمنع أي تكرار نهائياً
+// مسار إتمام المهمة مع التحقق الصارم المزدوج ومنح المكافأة الثابتة (1000 ذهبة) بدلاً من تكلفة المهمة
 app.post('/api/tasks/complete', async (req, res) => {
   try {
-    const { userId, taskId } = req.body;
+    const { userId, taskId, wasVisited } = req.body;
     if (!userId || !taskId) return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+
+    // التحقق الصارم الأمني: يجب التأكد من أن المستخدم قام بزيارة الرابط أولاً
+    if (!wasVisited) {
+      return res.status(400).json({ success: false, message: 'يجب الضغط على "ابدأ التنفيذ" وزيارة الرابط أولاً قبل التحقق واستلام المكافأة!' });
+    }
 
     let user = await User.findOne({ telegramId: userId });
     if (!user || user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
@@ -531,12 +536,12 @@ app.post('/api/tasks/complete', async (req, res) => {
     let task = await Task.findById(taskId);
     if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة' });
 
-    // التحقق الصارم جداً لمنع تكرار الإتمام
+    // التحقق الصارم لمنع تكرار الإتمام نهائياً
     if (task.completedBy && task.completedBy.includes(userId)) {
       return res.status(400).json({ success: false, message: 'لقد أتممت هذه المهمة مسبقاً ولا يمكنك تكرارها!' });
     }
 
-    let rewardAmount = 1000; // مكافأة افتراضية ثابتة لكل مهمة
+    const rewardAmount = 1000; // المكافأة الصحيحة والثابتة 1000 ذهبة
     user.gold = (user.gold || 0) + rewardAmount;
     
     task.current = (task.current || 0) + 1;
@@ -550,7 +555,7 @@ app.post('/api/tasks/complete', async (req, res) => {
     await user.save();
     await task.save();
 
-    res.json({ success: true, message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ذهبة`, user });
+    res.json({ success: true, rewardGold: rewardAmount, message: `تم إتمام المهمة بنجاح! حصلت على ${rewardAmount} ذهبة`, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
   }
