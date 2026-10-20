@@ -15,7 +15,8 @@ app.use(cors({
     return callback(new Error('Origin is not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-telegram-init-data'],
+  // نقبل أسماء الترويسات الشائعة، لكن جميعها تمر عبر تحقق Telegram المشفّر نفسه.
+  allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'telegram-init-data', 'Authorization'],
   maxAge: 600
 }));
 app.use(express.json({ limit: '100kb' }));
@@ -206,6 +207,19 @@ function randomId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// استخراج بيانات Telegram من ترويسات معروفة. لا نعتمد على userId وحده مطلقًا.
+// قبول أسماء ترويسات بديلة لا يضعف المصادقة لأن القيمة تظل خاضعة للتحقق المشفّر أدناه.
+function getTelegramInitData(req) {
+  const direct = req.get('x-telegram-init-data') || req.get('telegram-init-data');
+  if (direct && direct.trim()) return direct.trim();
+
+  const authorization = req.get('authorization') || '';
+  const match = authorization.match(/^(?:tma|Bearer)\s+(.+)$/i);
+  if (match && match[1]) return match[1].trim();
+
+  return '';
+}
+
 // التحقق من Telegram Mini App initData باستخدام رمز البوت على السيرفر.
 function verifyTelegramInitData(initData) {
   if (!TELEGRAM_BOT_TOKEN || !initData || typeof initData !== 'string') {
@@ -269,7 +283,7 @@ function verifyTelegramInitData(initData) {
 }
 
 function telegramAuth(req, res, next) {
-  const telegramUser = verifyTelegramInitData(req.get('x-telegram-init-data'));
+  const telegramUser = verifyTelegramInitData(getTelegramInitData(req));
   if (!telegramUser) {
     return res.status(401).json({
       success: false,
@@ -281,7 +295,7 @@ function telegramAuth(req, res, next) {
 }
 
 function rocketAuth(req, res, next) {
-  const initData = req.get('x-telegram-init-data');
+  const initData = getTelegramInitData(req);
   const telegramUser = verifyTelegramInitData(initData);
 
   if (!telegramUser) {
@@ -383,20 +397,11 @@ app.get('/', (req, res) => {
 app.get('/api/user/profile', userRequestAuth, async (req, res) => {
   try {
     const requestedUserId = req.query.userId ? String(req.query.userId) : '';
-    const initData = req.get('x-telegram-init-data');
-    const verifiedTelegramUser = initData ? verifyTelegramInitData(initData) : null;
+    // userRequestAuth سبق أن تحقق من التوقيع ووضع الهوية الموثوقة هنا.
+    const verifiedTelegramUser = req.telegramUser;
+    const userId = String(verifiedTelegramUser.id);
 
-    // إذا وصلت بيانات Telegram موقعة، فالمعرّف الموثوق يأتي منها لا من query string.
-    // نحافظ على التوافق القديم عند عدم إرسال initData، لكن لا نحدّث الاسم إلا ببيانات موثقة.
-    const userId = verifiedTelegramUser ? verifiedTelegramUser.id : requestedUserId;
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: 'تعذر تحديد المستخدم. افتح التطبيق من Telegram.'
-      });
-    }
-
-    if (verifiedTelegramUser && requestedUserId && requestedUserId !== verifiedTelegramUser.id) {
+    if (requestedUserId && requestedUserId !== userId) {
       return res.status(403).json({
         success: false,
         message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.'
