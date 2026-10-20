@@ -63,8 +63,9 @@ const ROCKET_GROWTH_RATE = 0.12; // سرعة نمو المضاعف
 const userSchema = new mongoose.Schema({
   telegramId: { type: String, required: true, unique: true },
   name: { type: String, default: 'زائر كريم' },
-  gold: { type: Number, default: 1000 },
-  diamonds: { type: Number, default: 10 },
+  // كل حساب جديد يبدأ برصيد صفر؛ لا توجد هدايا ابتدائية.
+  gold: { type: Number, default: 0 },
+  diamonds: { type: Number, default: 0 },
   balance: { type: Number, default: 0 },
   currency: { type: String, default: 'MAD' },
   referralCount: { type: Number, default: 0 },
@@ -369,8 +370,8 @@ app.get('/api/user/profile', async (req, res) => {
       user = new User({
         telegramId: userId,
         name: verifiedTelegramUser?.first_name || 'زائر كريم',
-        gold: 1000,
-        diamonds: 10,
+        gold: 0,
+        diamonds: 0,
         balance: 0
       });
     } else if (verifiedTelegramUser?.first_name) {
