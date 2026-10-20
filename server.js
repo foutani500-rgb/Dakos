@@ -21,7 +21,9 @@ mongoose.connect(MONGO_URI || 'mongodb://127.0.0.1:27017/moneyslayer')
   .catch((err) => console.error('❌ خطأ في الاتصال بقاعدة البيانات:', err));
 
 const ADMIN_ID = '6669520092';
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// يجب ضبط هذا المتغير في Railway باستخدام رمز البوت الحقيقي من BotFather.
+// لا تضع الرمز مباشرة في هذا الملف ولا تتجاوز التحقق عند غيابه.
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
 // مكافأة الإحالة الثابتة: 1000 Gold لكل مستخدم جديد تتم إحالته مرة واحدة فقط.
 const REFERRAL_REWARD_GOLD = 1000;
@@ -272,21 +274,40 @@ app.get('/', (req, res) => {
 
 app.get('/api/user/profile', async (req, res) => {
   try {
-    const { userId } = req.query;
+    const requestedUserId = req.query.userId ? String(req.query.userId) : '';
+    const initData = req.get('x-telegram-init-data');
+    const verifiedTelegramUser = initData ? verifyTelegramInitData(initData) : null;
+
+    // إذا وصلت بيانات Telegram موقعة، فالمعرّف الموثوق يأتي منها لا من query string.
+    // نحافظ على التوافق القديم عند عدم إرسال initData، لكن لا نحدّث الاسم إلا ببيانات موثقة.
+    const userId = verifiedTelegramUser ? verifiedTelegramUser.id : requestedUserId;
     if (!userId) {
-      return res.status(400).json({ success: false, message: 'Missing userId' });
+      return res.status(400).json({
+        success: false,
+        message: 'تعذر تحديد المستخدم. افتح التطبيق من Telegram.'
+      });
     }
 
-    let user = await User.findOne({ telegramId: String(userId) });
+    if (verifiedTelegramUser && requestedUserId && requestedUserId !== verifiedTelegramUser.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.'
+      });
+    }
+
+    let user = await User.findOne({ telegramId: userId });
 
     if (!user) {
       user = new User({
-        telegramId: String(userId),
+        telegramId: userId,
+        name: verifiedTelegramUser?.first_name || 'زائر كريم',
         gold: 1000,
         diamonds: 10,
         balance: 0
       });
-      await user.save();
+    } else if (verifiedTelegramUser?.first_name) {
+      // لا نغيّر الاسم إلا بعد نجاح التحقق من توقيع Telegram.
+      user.name = verifiedTelegramUser.first_name;
     }
 
     if (user.isBanned) {
@@ -296,6 +317,7 @@ app.get('/api/user/profile', async (req, res) => {
       });
     }
 
+    await user.save();
     res.json({ success: true, user });
   } catch (err) {
     console.error('profile error:', err);
@@ -1020,6 +1042,56 @@ app.get('/api/games/rocket/status', rocketAuth, async (req, res) => {
   }
 });
 
+// مزامنة حالة الجولة: هذا المسار مطلوب من GamesView.jsx أثناء اللعب.
+app.post('/api/games/rocket/state', rocketAuth, async (req, res) => {
+  try {
+    const userId = req.telegramUser.id;
+    const user = await User.findOne({ telegramId: userId });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'المستخدم غير موجود. افتح ملف المستخدم أولاً.'
+      });
+    }
+    if (user.isBanned) {
+      return res.status(403).json({ success: false, message: 'حساب محظور' });
+    }
+
+    let round = await RocketRound.findOne({ userId }).sort({ createdAt: -1 });
+    if (round?.status === 'running') {
+      round = await settleCrashIfNeeded(round);
+    }
+
+    const currentMultiplier = round?.status === 'running'
+      ? Math.min(calculateMultiplier(round.startedAt), round.crashMultiplier)
+      : null;
+
+    return res.json({
+      success: true,
+      balance: user.gold,
+      round: round ? {
+        roundId: round.roundId,
+        status: round.status,
+        betAmount: round.betAmount,
+        startedAt: round.startedAt,
+        currentMultiplier,
+        cashOutMultiplier: round.cashOutMultiplier,
+        wonAmount: round.wonAmount,
+        crashMultiplier: ['crashed', 'cashed_out'].includes(round.status)
+          ? round.crashMultiplier
+          : undefined
+      } : null
+    });
+  } catch (err) {
+    console.error('rocket state error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'تعذر تحديث حالة لعبة الصاروخ'
+    });
+  }
+});
+
 // بدء جولة: العميل يرسل الرهان فقط، ولا يرسل نتيجة أو مضاعف سحب.
 app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
   try {
@@ -1480,6 +1552,6 @@ app.listen(PORT, () => {
   console.log(`🚀 السيرفر يعمل على المنفذ ${PORT}`);
 
   if (!TELEGRAM_BOT_TOKEN) {
-    console.warn('⚠️ TELEGRAM_BOT_TOKEN غير مضبوط؛ مسارات الصاروخ سترفض الطلبات حتى تضبطه.');
+    console.warn('⚠️ TELEGRAM_BOT_TOKEN غير مضبوط في Railway؛ ستُرفض طلبات الصاروخ بـ 401 حتى تضيف رمز البوت الصحيح من BotFather.');
   }
 });
