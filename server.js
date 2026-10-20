@@ -17,7 +17,21 @@ if (!MONGO_URI) {
 }
 
 mongoose.connect(MONGO_URI || 'mongodb://127.0.0.1:27017/moneyslayer')
-  .then(() => console.log('✅ تم الاتصال بقاعدة بيانات MongoDB'))
+  .then(() => {
+    console.log('✅ تم الاتصال بقاعدة بيانات MongoDB');
+    // محرك الجولات يعمل حتى عند عدم وجود لاعبين متصلين.
+    // يبدأ فقط بعد نجاح اتصال قاعدة البيانات، وأخطاء الدورة لا توقف السيرفر.
+    if (!globalThis.__rocketRoundTimer) {
+      globalThis.__rocketRoundTimer = setInterval(async () => {
+        if (mongoose.connection.readyState !== 1) return;
+        try {
+          await ensurePublicRocketRound();
+        } catch (err) {
+          console.error('❌ خطأ في دورة الصاروخ الخلفية:', err.message);
+        }
+      }, 500);
+    }
+  })
   .catch((err) => console.error('❌ خطأ في الاتصال بقاعدة البيانات:', err));
 
 const ADMIN_ID = '6669520092';
@@ -31,7 +45,7 @@ const REFERRAL_REWARD_GOLD = 1000;
 // إعدادات الصاروخ
 const ROCKET_LOSS_RATE = 55;
 const ROCKET_WIN_RATE = 45;
-const ROCKET_MAX_MULTIPLIER = 10;
+const ROCKET_MAX_MULTIPLIER = 20;
 const ROCKET_MIN_BET = 1;
 const ROCKET_MAX_BET = 1000000;
 const ROCKET_GROWTH_RATE = 0.12; // سرعة نمو المضاعف
@@ -115,6 +129,34 @@ const rocketRoundSchema = new mongoose.Schema({
 
 rocketRoundSchema.index({ userId: 1, status: 1 });
 const RocketRound = mongoose.model('RocketRound', rocketRoundSchema);
+
+// الجولات العامة المشتركة: يشاهد جميع اللاعبين الصاروخ ونقطة الانفجار نفسها.
+const publicRocketRoundSchema = new mongoose.Schema({
+  roundId: { type: String, required: true, unique: true },
+  status: { type: String, enum: ['betting', 'running', 'crashed'], default: 'betting', index: true },
+  crashMultiplier: { type: Number, required: true },
+  bettingEndsAt: { type: Date, required: true },
+  startedAt: { type: Date, default: null },
+  crashAt: { type: Date, default: null },
+  crashedAt: { type: Date, default: null }
+}, { timestamps: true });
+publicRocketRoundSchema.index({ status: 1, createdAt: -1 });
+const PublicRocketRound = mongoose.model('PublicRocketRound', publicRocketRoundSchema);
+
+// لا يظهر اللاعب في قائمة الجولة إلا بعد إنشاء رهان فعلي وحفظه.
+const rocketBetSchema = new mongoose.Schema({
+  roundId: { type: String, required: true, index: true },
+  userId: { type: String, required: true, index: true },
+  betSlot: { type: Number, default: 1, min: 1, max: 2 },
+  betAmount: { type: Number, required: true },
+  status: { type: String, enum: ['active', 'cashed_out', 'lost'], default: 'active', index: true },
+  cashOutMultiplier: { type: Number, default: null },
+  wonAmount: { type: Number, default: 0 },
+  cashedOutAt: { type: Date, default: null }
+}, { timestamps: true });
+rocketBetSchema.index({ roundId: 1, userId: 1, betSlot: 1 }, { unique: true });
+rocketBetSchema.index({ roundId: 1, status: 1 });
+const RocketBet = mongoose.model('RocketBet', rocketBetSchema);
 
 // --------------------------------------------------
 // أدوات مساعدة
@@ -979,309 +1021,272 @@ app.post('/api/tasks/complete', async (req, res) => {
 });
 
 // --------------------------------------------------
-// 6. لعبة الصاروخ - مسارات الجولة الجديدة
+// 6. لعبة الصاروخ - جولات مشتركة متعددة اللاعبين
 // --------------------------------------------------
 
-// جلب رصيد اللاعب والجولة الحالية. يتطلب Telegram initData صحيحًا.
+const ROCKET_BETTING_SECONDS = 8;
+const ROCKET_ROUND_PAUSE_SECONDS = 3;
+
+function publicTelegramId(id) {
+  const value = String(id || '');
+  if (value.length <= 2) return '*'.repeat(value.length);
+  return `${value.slice(0, 2)}${'*'.repeat(Math.min(8, Math.max(4, value.length - 2)))}`;
+}
+
+async function ensurePublicRocketRound() {
+  const now = new Date();
+  let round = await PublicRocketRound.findOne({ status: { $in: ['betting', 'running'] } })
+    .sort({ createdAt: -1 });
+
+  if (round && round.status === 'betting' && now >= round.bettingEndsAt) {
+    const startedAt = round.bettingEndsAt;
+    const crashAt = new Date(startedAt.getTime() + (Math.log(round.crashMultiplier) / ROCKET_GROWTH_RATE) * 1000);
+    round = await PublicRocketRound.findOneAndUpdate(
+      { _id: round._id, status: 'betting' },
+      { $set: { status: 'running', startedAt, crashAt } },
+      { new: true }
+    ) || await PublicRocketRound.findById(round._id);
+  }
+
+  if (round && round.status === 'running' && round.crashAt && now >= round.crashAt) {
+    await PublicRocketRound.updateOne(
+      { _id: round._id, status: 'running' },
+      { $set: { status: 'crashed', crashedAt: now } }
+    );
+    await RocketBet.updateMany(
+      { roundId: round.roundId, status: 'active' },
+      { $set: { status: 'lost' } }
+    );
+    round = await PublicRocketRound.findById(round._id);
+  }
+
+  if (!round || (round.status === 'crashed' && now.getTime() - new Date(round.crashedAt || round.updatedAt).getTime() >= ROCKET_ROUND_PAUSE_SECONDS * 1000)) {
+    const current = await PublicRocketRound.findOne({ status: { $in: ['betting', 'running'] } }).sort({ createdAt: -1 });
+    if (current) return current;
+    const createdAt = new Date();
+    try {
+      round = await new PublicRocketRound({
+        roundId: randomId(),
+        status: 'betting',
+        crashMultiplier: generateCrashMultiplier(),
+        bettingEndsAt: new Date(createdAt.getTime() + ROCKET_BETTING_SECONDS * 1000)
+      }).save();
+    } catch (err) {
+      // إذا أنشأ طلب متزامن الجولة أولًا، نقرأ الجولة التي أنشأها.
+      round = await PublicRocketRound.findOne({ status: { $in: ['betting', 'running'] } }).sort({ createdAt: -1 });
+      if (!round) throw err;
+    }
+  }
+  return round;
+}
+
+async function getPublicRocketBets(roundId) {
+  const bets = await RocketBet.find({ roundId }).sort({ createdAt: -1 }).limit(100).lean();
+  if (!bets.length) return [];
+  const ids = [...new Set(bets.map((bet) => bet.userId))];
+  const users = await User.find({ telegramId: { $in: ids } }).select('telegramId name').lean();
+  const byId = new Map(users.map((user) => [user.telegramId, user]));
+  return bets.map((bet) => {
+    const user = byId.get(bet.userId);
+    return {
+      betId: String(bet._id),
+      userId: publicTelegramId(bet.userId),
+      name: user?.name || 'مستخدم Telegram',
+      betSlot: bet.betSlot,
+      betAmount: bet.betAmount,
+      status: bet.status,
+      cashOutMultiplier: bet.cashOutMultiplier,
+      wonAmount: bet.wonAmount
+    };
+  });
+}
+
+async function rocketRoundPayload(round, userId) {
+  if (!round) return { round: null, bets: [] };
+  const [bets, ownBets] = await Promise.all([
+    getPublicRocketBets(round.roundId),
+    userId ? RocketBet.find({ roundId: round.roundId, userId }).sort({ betSlot: 1 }).lean() : []
+  ]);
+  const now = Date.now();
+  const currentMultiplier = round.status === 'running' && round.startedAt
+    ? Math.min(calculateMultiplier(round.startedAt, now), round.crashMultiplier)
+    : (round.status === 'betting' ? 1 : null);
+  return {
+    round: {
+      roundId: round.roundId,
+      status: round.status,
+      bettingEndsAt: round.bettingEndsAt,
+      startedAt: round.startedAt,
+      crashedAt: round.crashedAt,
+      currentMultiplier,
+      // لا نكشف نقطة الانفجار قبل انتهاء الجولة.
+      crashMultiplier: round.status === 'crashed' ? round.crashMultiplier : undefined,
+      ownBets: ownBets.map((bet) => ({
+        betId: String(bet._id), betSlot: bet.betSlot, betAmount: bet.betAmount,
+        status: bet.status, cashOutMultiplier: bet.cashOutMultiplier, wonAmount: bet.wonAmount
+      }))
+    },
+    bets
+  };
+}
+
+async function sendRocketState(req, res) {
+  const userId = req.telegramUser.id;
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود. افتح ملف المستخدم أولاً.' });
+  if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+  const globalRound = await ensurePublicRocketRound();
+  const payload = await rocketRoundPayload(globalRound, userId);
+  return res.json({
+    success: true,
+    balance: user.gold,
+    config: {
+      lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE,
+      maxMultiplier: ROCKET_MAX_MULTIPLIER, minBet: ROCKET_MIN_BET,
+      maxBet: ROCKET_MAX_BET, bettingSeconds: ROCKET_BETTING_SECONDS
+    },
+    round: payload.round,
+    bets: payload.bets
+  });
+}
+
 app.get('/api/games/rocket/status', rocketAuth, async (req, res) => {
-  try {
-    const userId = req.telegramUser.id;
-
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'المستخدم غير موجود. افتح ملف المستخدم أولاً.'
-      });
-    }
-
-    if (user.isBanned) {
-      return res.status(403).json({ success: false, message: 'حساب محظور' });
-    }
-
-    let round = await RocketRound.findOne({
-      userId,
-      status: 'running'
-    }).sort({ createdAt: -1 });
-
-    if (round) {
-      round = await settleCrashIfNeeded(round);
-    }
-
-    const currentMultiplier = round && round.status === 'running'
-      ? Math.min(
-          calculateMultiplier(round.startedAt),
-          round.crashMultiplier
-        )
-      : null;
-
-    res.json({
-      success: true,
-      balance: user.gold,
-      config: {
-        lossRate: ROCKET_LOSS_RATE,
-        winRate: ROCKET_WIN_RATE,
-        maxMultiplier: ROCKET_MAX_MULTIPLIER,
-        minBet: ROCKET_MIN_BET,
-        maxBet: ROCKET_MAX_BET
-      },
-      round: round ? {
-        roundId: round.roundId,
-        status: round.status,
-        betAmount: round.betAmount,
-        startedAt: round.startedAt,
-        currentMultiplier,
-        cashOutMultiplier: round.cashOutMultiplier,
-        wonAmount: round.wonAmount,
-        crashMultiplier: round.status === 'crashed' ? round.crashMultiplier : undefined
-      } : null
-    });
-  } catch (err) {
+  try { return await sendRocketState(req, res); }
+  catch (err) {
     console.error('rocket status error:', err);
-    res.status(500).json({ success: false, message: 'خطأ في جلب بيانات لعبة الصاروخ' });
+    return res.status(500).json({ success: false, message: 'خطأ في جلب بيانات لعبة الصاروخ' });
   }
 });
 
-// مزامنة حالة الجولة: هذا المسار مطلوب من GamesView.jsx أثناء اللعب.
 app.post('/api/games/rocket/state', rocketAuth, async (req, res) => {
-  try {
-    const userId = req.telegramUser.id;
-    const user = await User.findOne({ telegramId: userId });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'المستخدم غير موجود. افتح ملف المستخدم أولاً.'
-      });
-    }
-    if (user.isBanned) {
-      return res.status(403).json({ success: false, message: 'حساب محظور' });
-    }
-
-    let round = await RocketRound.findOne({ userId }).sort({ createdAt: -1 });
-    if (round?.status === 'running') {
-      round = await settleCrashIfNeeded(round);
-    }
-
-    const currentMultiplier = round?.status === 'running'
-      ? Math.min(calculateMultiplier(round.startedAt), round.crashMultiplier)
-      : null;
-
-    return res.json({
-      success: true,
-      balance: user.gold,
-      round: round ? {
-        roundId: round.roundId,
-        status: round.status,
-        betAmount: round.betAmount,
-        startedAt: round.startedAt,
-        currentMultiplier,
-        cashOutMultiplier: round.cashOutMultiplier,
-        wonAmount: round.wonAmount,
-        crashMultiplier: ['crashed', 'cashed_out'].includes(round.status)
-          ? round.crashMultiplier
-          : undefined
-      } : null
-    });
-  } catch (err) {
+  try { return await sendRocketState(req, res); }
+  catch (err) {
     console.error('rocket state error:', err);
-    return res.status(500).json({
-      success: false,
-      message: 'تعذر تحديث حالة لعبة الصاروخ'
-    });
+    return res.status(500).json({ success: false, message: 'تعذر تحديث حالة لعبة الصاروخ' });
   }
 });
 
-// بدء جولة: العميل يرسل الرهان فقط، ولا يرسل نتيجة أو مضاعف سحب.
+// هذا المسار يسمح برهان واحد أو رهانيْن في خانتي الواجهة خلال نافذة المراهنة.
+// يمكن للصاروخ أن يعمل دون أي رهانات؛ وجود رهان ليس شرطًا لإنشاء الجولة أو تحريكها.
 app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
   try {
     const userId = req.telegramUser.id;
     const betAmount = Number(req.body.betAmount);
-
-    if (
-      !Number.isFinite(betAmount) ||
-      betAmount < ROCKET_MIN_BET ||
-      betAmount > ROCKET_MAX_BET
-    ) {
-      return res.status(400).json({ success: false, message: 'مبلغ الرهان غير صالح' });
+    const betSlot = Number(req.body.betSlot || 1);
+    if (!Number.isSafeInteger(betAmount) || betAmount < ROCKET_MIN_BET || betAmount > ROCKET_MAX_BET) {
+      return res.status(400).json({ success: false, message: 'مبلغ الرهان يجب أن يكون عددًا صحيحًا ضمن الحد المسموح' });
+    }
+    if (![1, 2].includes(betSlot)) {
+      return res.status(400).json({ success: false, message: 'خانة الرهان غير صالحة' });
     }
 
     const user = await User.findOne({ telegramId: userId });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
 
-    const existingRound = await RocketRound.findOne({ userId, status: 'running' });
-    if (existingRound) {
-      return res.status(409).json({
-        success: false,
-        message: 'لديك جولة قائمة بالفعل',
-        roundId: existingRound.roundId
-      });
+    const round = await ensurePublicRocketRound();
+    if (round.status !== 'betting' || Date.now() >= new Date(round.bettingEndsAt).getTime()) {
+      return res.status(409).json({ success: false, message: 'بدأ صعود الصاروخ؛ انتظر الجولة التالية', roundId: round.roundId });
+    }
+    if (await RocketBet.findOne({ roundId: round.roundId, userId, betSlot })) {
+      return res.status(409).json({ success: false, message: 'وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة' });
     }
 
-    // خصم شرطي للرصيد، لتفادي خصم أكثر من رصيد المستخدم في طلبات متزامنة.
     const updatedUser = await User.findOneAndUpdate(
-      {
-        telegramId: userId,
-        isBanned: false,
-        gold: { $gte: betAmount }
-      },
+      { telegramId: userId, isBanned: false, gold: { $gte: betAmount } },
       { $inc: { gold: -betAmount } },
       { new: true }
     );
+    if (!updatedUser) return res.status(400).json({ success: false, message: 'رصيدك من الذهب غير كافٍ' });
 
-    if (!updatedUser) {
-      return res.status(400).json({ success: false, message: 'رصيدك من الذهب غير كافٍ' });
-    }
-
-    const startedAt = new Date();
-    const crashMultiplier = generateCrashMultiplier();
-    const crashAt = getCrashAt(startedAt, crashMultiplier);
-
-    let round;
-
+    let bet;
     try {
-      round = await new RocketRound({
-        roundId: randomId(),
-        userId,
-        betAmount,
-        crashMultiplier,
-        startedAt,
-        crashAt,
-        status: 'running'
-      }).save();
-    } catch (saveError) {
-      // إرجاع الرهان إذا تعذر حفظ الجولة.
+      bet = await new RocketBet({ roundId: round.roundId, userId, betSlot, betAmount, status: 'active' }).save();
+    } catch (err) {
       await User.updateOne({ telegramId: userId }, { $inc: { gold: betAmount } });
-      throw saveError;
+      if (err.code === 11000) return res.status(409).json({ success: false, message: 'وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة' });
+      throw err;
     }
 
-    res.status(201).json({
-      success: true,
-      message: 'بدأت الجولة!',
-      balance: updatedUser.gold,
-      round: {
-        roundId: round.roundId,
-        status: round.status,
-        betAmount: round.betAmount,
-        startedAt: round.startedAt,
-        currentMultiplier: 1
+    const payload = await rocketRoundPayload(round, userId);
+    return res.status(201).json({
+      success: true, message: 'تم تسجيل رهانك في الجولة المشتركة', balance: updatedUser.gold,
+      round: payload.round, bets: payload.bets, bet: {
+        betId: String(bet._id), roundId: bet.roundId, betSlot: bet.betSlot, betAmount: bet.betAmount, status: bet.status
       }
     });
   } catch (err) {
     console.error('rocket start error:', err);
-    res.status(500).json({ success: false, message: 'تعذر بدء جولة الصاروخ' });
+    return res.status(500).json({ success: false, message: 'تعذر تسجيل رهان الصاروخ' });
   }
 });
 
-// سحب المكسب: لا يقبل المضاعف من العميل، بل يحسبه السيرفر من وقت الجولة.
 app.post('/api/games/rocket/cashout', rocketAuth, async (req, res) => {
   try {
     const userId = req.telegramUser.id;
-    const { roundId } = req.body;
-
+    const { roundId, betId, betSlot } = req.body;
     if (!roundId || typeof roundId !== 'string') {
       return res.status(400).json({ success: false, message: 'معرف الجولة غير صالح' });
     }
 
-    let round = await RocketRound.findOne({ roundId, userId });
-
-    if (!round) {
-      return res.status(404).json({ success: false, message: 'الجولة غير موجودة' });
+    const round = await PublicRocketRound.findOne({ roundId });
+    if (!round) return res.status(404).json({ success: false, message: 'الجولة غير موجودة' });
+    await ensurePublicRocketRound();
+    const now = new Date();
+    if (round.status !== 'running' || !round.crashAt || now >= round.crashAt) {
+      return res.status(409).json({ success: false, crashed: true, message: 'انفجر الصاروخ أو انتهت الجولة قبل السحب', crashMultiplier: round.status === 'crashed' ? round.crashMultiplier : undefined });
     }
 
-    if (round.status === 'cashed_out') {
-      return res.status(409).json({
-        success: false,
-        message: 'تم السحب من هذه الجولة مسبقًا',
-        wonAmount: round.wonAmount,
-        cashOutMultiplier: round.cashOutMultiplier
-      });
-    }
+    const filter = { roundId, userId, status: 'active' };
+    if (betId) filter._id = betId;
+    else if (betSlot != null) filter.betSlot = Number(betSlot);
+    const bet = await RocketBet.findOne(filter);
+    if (!bet) return res.status(404).json({ success: false, message: 'لا يوجد رهان نشط لك في هذه الخانة' });
 
-    if (round.status === 'crashed' || Date.now() >= new Date(round.crashAt).getTime()) {
-      round = await settleCrashIfNeeded(round);
-
-      const userAfterLoss = await User.findOne({ telegramId: userId });
-
-      return res.status(409).json({
-        success: false,
-        crashed: true,
-        message: `انفجر الصاروخ عند ${round.crashMultiplier}x وخسرت الرهان`,
-        crashMultiplier: round.crashMultiplier,
-        balance: userAfterLoss ? userAfterLoss.gold : 0
-      });
-    }
-
-    const multiplier = Math.min(
-      calculateMultiplier(round.startedAt),
-      round.crashMultiplier
-    );
-
-    const wonAmount = Math.floor(round.betAmount * multiplier);
-
-    // قفل الجولة ذريًا؛ طلب سحب ثانٍ لا يمكنه تسوية الجولة نفسها.
-    const claimedRound = await RocketRound.findOneAndUpdate(
-      {
-        _id: round._id,
-        status: 'running',
-        crashAt: { $gt: new Date() }
-      },
-      {
-        $set: {
-          status: 'cashed_out',
-          cashOutMultiplier: multiplier,
-          wonAmount,
-          settledAt: new Date()
-        }
-      },
+    const multiplier = Math.min(calculateMultiplier(round.startedAt, now.getTime()), round.crashMultiplier);
+    const wonAmount = Math.floor(bet.betAmount * multiplier);
+    const claimedBet = await RocketBet.findOneAndUpdate(
+      { _id: bet._id, status: 'active' },
+      { $set: { status: 'cashed_out', cashOutMultiplier: multiplier, wonAmount, cashedOutAt: now } },
       { new: true }
     );
-
-    if (!claimedRound) {
-      const latestRound = await RocketRound.findById(round._id);
-      const latestUser = await User.findOne({ telegramId: userId });
-
-      return res.status(409).json({
-        success: false,
-        message: latestRound?.status === 'crashed'
-          ? 'انفجر الصاروخ قبل تنفيذ السحب'
-          : 'تمت تسوية الجولة مسبقًا',
-        balance: latestUser ? latestUser.gold : 0
-      });
-    }
+    if (!claimedBet) return res.status(409).json({ success: false, message: 'تمت تسوية هذا الرهان مسبقًا' });
 
     const updatedUser = await User.findOneAndUpdate(
       { telegramId: userId, isBanned: false },
       { $inc: { gold: wonAmount } },
       { new: true }
     );
-
     if (!updatedUser) {
-      // لا نعيد فتح الجولة تلقائيًا؛ يجب فحص هذه الحالة في السجلات.
-      console.error('CRITICAL: cashout settled but user balance update failed', round.roundId);
-      return res.status(500).json({
-        success: false,
-        message: 'تم تسجيل السحب لكن تعذر تحديث الرصيد. يرجى التواصل مع الدعم.'
-      });
+      console.error('CRITICAL: rocket bet cashed out but balance update failed', bet._id);
+      return res.status(500).json({ success: false, message: 'سُجل السحب لكن تعذر تحديث الرصيد؛ تواصل مع الدعم' });
     }
 
-    res.json({
-      success: true,
-      message: `نجح السحب عند ${multiplier}x`,
-      roundId: claimedRound.roundId,
-      cashOutMultiplier: multiplier,
-      wonAmount,
-      balance: updatedUser.gold,
-      roundStatus: 'cashed_out'
+    const payload = await rocketRoundPayload(round, userId);
+    return res.json({
+      success: true, message: `نجح السحب عند ${multiplier}x`, roundId,
+      betId: String(claimedBet._id), betSlot: claimedBet.betSlot,
+      cashOutMultiplier: multiplier, wonAmount, balance: updatedUser.gold,
+      roundStatus: 'cashed_out', round: payload.round, bets: payload.bets
     });
   } catch (err) {
     console.error('rocket cashout error:', err);
-    res.status(500).json({ success: false, message: 'تعذر تنفيذ السحب' });
+    return res.status(500).json({ success: false, message: 'تعذر تنفيذ السحب' });
   }
 });
 
-// توافق واضح مع الواجهة القديمة: نرفض المسار القديم بدل قبول نتيجة يحددها العميل.
+// بيانات عامة لعرض رهانات الجولة الحالية؛ لا نُنشئ أسماء أو رهانات وهمية.
+app.get('/api/games/rocket/bets', rocketAuth, async (req, res) => {
+  try {
+    const round = await ensurePublicRocketRound();
+    return res.json({ success: true, roundId: round.roundId, bets: await getPublicRocketBets(round.roundId) });
+  } catch (err) {
+    console.error('rocket bets error:', err);
+    return res.status(500).json({ success: false, message: 'تعذر جلب رهانات الجولة' });
+  }
+});
+
+// توافق واضح مع الواجهة القديمة: لا نقبل نتيجة يحددها العميل.
 app.post('/api/games/rocket/play', (req, res) => {
   res.status(410).json({
     success: false,
@@ -1389,21 +1394,76 @@ app.post('/api/admin/process-transaction', async (req, res) => {
   }
 });
 
+app.get('/api/admin/rocket', async (req, res) => {
+  try {
+    if (String(req.query.adminId) !== ADMIN_ID) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+    const activeRound = await PublicRocketRound.findOne({ status: { $in: ['betting', 'running'] } })
+      .sort({ createdAt: -1 }).lean();
+    const recentRounds = await PublicRocketRound.find().sort({ createdAt: -1 }).limit(20).lean();
+    const roundIds = recentRounds.map((round) => round.roundId);
+    const [betStats, recentBets] = await Promise.all([
+      RocketBet.aggregate([
+        { $match: { roundId: { $in: roundIds } } },
+        { $group: {
+          _id: '$roundId', totalBets: { $sum: 1 },
+          totalWagered: { $sum: '$betAmount' },
+          cashedOut: { $sum: { $cond: [{ $eq: ['$status', 'cashed_out'] }, 1, 0] } },
+          lost: { $sum: { $cond: [{ $eq: ['$status', 'lost'] }, 1, 0] } },
+          paidOut: { $sum: '$wonAmount' }
+        } }
+      ]),
+      RocketBet.find({ roundId: { $in: roundIds } }).sort({ createdAt: -1 }).limit(100).lean()
+    ]);
+    const statsByRound = new Map(betStats.map((item) => [item._id, item]));
+    res.json({
+      success: true,
+      config: { lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE, maxMultiplier: ROCKET_MAX_MULTIPLIER, growthRate: ROCKET_GROWTH_RATE },
+      activeRound: activeRound ? {
+        roundId: activeRound.roundId, status: activeRound.status,
+        bettingEndsAt: activeRound.bettingEndsAt, startedAt: activeRound.startedAt,
+        crashedAt: activeRound.crashedAt,
+        crashMultiplier: activeRound.status === 'crashed' ? activeRound.crashMultiplier : undefined
+      } : null,
+      recentRounds: recentRounds.map((round) => ({
+        roundId: round.roundId, status: round.status, createdAt: round.createdAt,
+        startedAt: round.startedAt, crashedAt: round.crashedAt,
+        crashMultiplier: round.status === 'crashed' ? round.crashMultiplier : undefined,
+        stats: statsByRound.get(round.roundId) || { totalBets: 0, totalWagered: 0, cashedOut: 0, lost: 0, paidOut: 0 }
+      })),
+      recentBets: recentBets.map((bet) => ({
+        id: String(bet._id), roundId: bet.roundId, userId: publicTelegramId(bet.userId),
+        betSlot: bet.betSlot, betAmount: bet.betAmount, status: bet.status,
+        cashOutMultiplier: bet.cashOutMultiplier, wonAmount: bet.wonAmount, createdAt: bet.createdAt
+      }))
+    });
+  } catch (err) {
+    console.error('admin rocket error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب بيانات الصاروخ' });
+  }
+});
+
 app.post('/api/admin/update-rocket', async (req, res) => {
   try {
     if (String(req.body.adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
-
-    res.json({
-      success: true,
-      message: 'إعدادات الصاروخ الحالية محفوظة على السيرفر',
-      config: {
-        lossRate: ROCKET_LOSS_RATE,
-        winRate: ROCKET_WIN_RATE,
-        maxMultiplier: ROCKET_MAX_MULTIPLIER
-      }
-    });
+    const requestedKeys = ['lossRate', 'winRate', 'maxMultiplier'];
+    const hasChanges = requestedKeys.some((key) => req.body[key] !== undefined);
+    const config = {
+      lossRate: ROCKET_LOSS_RATE,
+      winRate: ROCKET_WIN_RATE,
+      maxMultiplier: ROCKET_MAX_MULTIPLIER
+    };
+    if (hasChanges) {
+      return res.status(400).json({
+        success: false,
+        message: 'تعديل إعدادات الصاروخ غير مدعوم حاليًا لأن الإعدادات ليست مخزنة في قاعدة البيانات. لم يتم حفظ أي تغيير.',
+        config
+      });
+    }
+    return res.json({ success: true, message: 'هذه هي الإعدادات الحالية؛ لم يتم إجراء أي تعديل.', config });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ' });
   }
