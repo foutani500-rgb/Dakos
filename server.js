@@ -43,9 +43,13 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const REFERRAL_REWARD_GOLD = 1000;
 
 // إعدادات الصاروخ
-const ROCKET_LOSS_RATE = 55;
-const ROCKET_WIN_RATE = 45;
-const ROCKET_MAX_MULTIPLIER = 20;
+// هامش نظري مستهدف للعبة: 5% على المدى الطويل وفق نموذج الاحتمالات أدناه؛
+// ليس ضمانًا لربح المنصة في كل جولة أو فترة قصيرة.
+const ROCKET_HOUSE_EDGE = 0.05;
+// حقول توافق قديمة للواجهة؛ ليست نسبة فوز مضمونة لكل لاعب.
+const ROCKET_LOSS_RATE = 65;
+const ROCKET_WIN_RATE = 35;
+const ROCKET_MAX_MULTIPLIER = 30;
 const ROCKET_MIN_BET = 1;
 const ROCKET_MAX_BET = 1000000;
 const ROCKET_GROWTH_RATE = 0.12; // سرعة نمو المضاعف
@@ -265,16 +269,16 @@ function calculateMultiplier(startedAt, now = Date.now()) {
   return Number(Math.exp(ROCKET_GROWTH_RATE * elapsedSeconds).toFixed(2));
 }
 
-// هذا التوزيع يجعل 55% من الجولات ضمن نطاق منخفض و45% ضمن نطاق أعلى.
-// لا يعني أن نسبة فوز اللاعبين الفعلية مضمونة عند 45%؛ فهي تعتمد أيضًا على توقيت السحب.
+// يولّد نقطة الانهيار بتوزيع ذي هامش نظري مستهدف 5% عند السحب على مضاعف ثابت.
+// توجد احتمالية لانهيار فوري تحت 1.00x؛ وهذا مقصود في نموذج Crash القياسي.
+// سقف 30x يعني أن احتمال تجاوز السقف يُجمع عند 30x، ولا يضمن وصول كل جولة إليه.
+// النتيجة مستقلة عن هوية اللاعب وحجم رهانه، ولا تُعد نسبة فوز ثابتة لكل لاعب.
 function generateCrashMultiplier() {
-  const rand = crypto.randomInt(0, 10000) / 100;
-
-  if (rand < ROCKET_LOSS_RATE) {
-    return Number((1 + Math.random() * 0.30).toFixed(2));
-  }
-
-  return Number((1.31 + Math.random() * (ROCKET_MAX_MULTIPLIER - 1.31)).toFixed(2));
+  // rand في المجال (0, 1] لتجنب القسمة على صفر.
+  const rand = (crypto.randomInt(0, 1000000) + 1) / 1000000;
+  const rawMultiplier = (1 - ROCKET_HOUSE_EDGE) / rand;
+  const cappedMultiplier = Math.min(ROCKET_MAX_MULTIPLIER, rawMultiplier);
+  return Number(Math.max(0.01, cappedMultiplier).toFixed(2));
 }
 
 // الوقت الذي يصل فيه المضاعف النظري إلى نقطة الانفجار.
@@ -1142,7 +1146,7 @@ async function sendRocketState(req, res) {
     balance: user.gold,
     config: {
       lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE,
-      maxMultiplier: ROCKET_MAX_MULTIPLIER, minBet: ROCKET_MIN_BET,
+      houseEdge: ROCKET_HOUSE_EDGE, maxMultiplier: ROCKET_MAX_MULTIPLIER, minBet: ROCKET_MIN_BET,
       maxBet: ROCKET_MAX_BET, bettingSeconds: ROCKET_BETTING_SECONDS
     },
     round: payload.round,
@@ -1316,7 +1320,10 @@ app.get('/api/admin/dashboard', async (req, res) => {
       stats: {
         totalUsers,
         activeToday: Math.floor(totalUsers * 0.4),
-        totalRevenue: 4250,
+        totalRevenue: await RocketBet.aggregate([
+          { $group: { _id: null, wagered: { $sum: '$betAmount' }, paidOut: { $sum: '$wonAmount' } } },
+          { $project: { _id: 0, net: { $subtract: ['$wagered', '$paidOut'] } } }
+        ]).then((rows) => rows[0]?.net || 0),
         pendingCount: pendingTxs.length
       },
       transactions: pendingTxs.map((t) => ({
@@ -1342,6 +1349,7 @@ app.get('/api/admin/dashboard', async (req, res) => {
       rocketConfig: {
         lossRate: ROCKET_LOSS_RATE,
         winRate: ROCKET_WIN_RATE,
+        houseEdge: ROCKET_HOUSE_EDGE,
         maxMultiplier: ROCKET_MAX_MULTIPLIER
       }
     });
@@ -1419,7 +1427,7 @@ app.get('/api/admin/rocket', async (req, res) => {
     const statsByRound = new Map(betStats.map((item) => [item._id, item]));
     res.json({
       success: true,
-      config: { lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE, maxMultiplier: ROCKET_MAX_MULTIPLIER, growthRate: ROCKET_GROWTH_RATE },
+      config: { lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE, houseEdge: ROCKET_HOUSE_EDGE, maxMultiplier: ROCKET_MAX_MULTIPLIER, growthRate: ROCKET_GROWTH_RATE },
       activeRound: activeRound ? {
         roundId: activeRound.roundId, status: activeRound.status,
         bettingEndsAt: activeRound.bettingEndsAt, startedAt: activeRound.startedAt,
@@ -1454,6 +1462,7 @@ app.post('/api/admin/update-rocket', async (req, res) => {
     const config = {
       lossRate: ROCKET_LOSS_RATE,
       winRate: ROCKET_WIN_RATE,
+      houseEdge: ROCKET_HOUSE_EDGE,
       maxMultiplier: ROCKET_MAX_MULTIPLIER
     };
     if (hasChanges) {
