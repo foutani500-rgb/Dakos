@@ -15,8 +15,7 @@ app.use(cors({
     return callback(new Error('Origin is not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  // نقبل أسماء الترويسات الشائعة، لكن جميعها تمر عبر تحقق Telegram المشفّر نفسه.
-  allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'telegram-init-data', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'x-telegram-init-data'],
   maxAge: 600
 }));
 app.use(express.json({ limit: '100kb' }));
@@ -106,6 +105,17 @@ const taskSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const Task = mongoose.model('Task', taskSchema);
+
+// Short-lived, single-use server-issued proof that a user opened a task link.
+const taskVisitTicketSchema = new mongoose.Schema({
+  tokenHash: { type: String, required: true, unique: true, index: true },
+  taskId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+  userId: { type: String, required: true, index: true },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } },
+  usedAt: { type: Date, default: null }
+}, { timestamps: true });
+const TaskVisitTicket = mongoose.model('TaskVisitTicket', taskVisitTicketSchema);
+
 
 const promoSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
@@ -207,19 +217,6 @@ function randomId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-// استخراج بيانات Telegram من ترويسات معروفة. لا نعتمد على userId وحده مطلقًا.
-// قبول أسماء ترويسات بديلة لا يضعف المصادقة لأن القيمة تظل خاضعة للتحقق المشفّر أدناه.
-function getTelegramInitData(req) {
-  const direct = req.get('x-telegram-init-data') || req.get('telegram-init-data');
-  if (direct && direct.trim()) return direct.trim();
-
-  const authorization = req.get('authorization') || '';
-  const match = authorization.match(/^(?:tma|Bearer)\s+(.+)$/i);
-  if (match && match[1]) return match[1].trim();
-
-  return '';
-}
-
 // التحقق من Telegram Mini App initData باستخدام رمز البوت على السيرفر.
 function verifyTelegramInitData(initData) {
   if (!TELEGRAM_BOT_TOKEN || !initData || typeof initData !== 'string') {
@@ -283,7 +280,7 @@ function verifyTelegramInitData(initData) {
 }
 
 function telegramAuth(req, res, next) {
-  const telegramUser = verifyTelegramInitData(getTelegramInitData(req));
+  const telegramUser = verifyTelegramInitData(req.get('x-telegram-init-data'));
   if (!telegramUser) {
     return res.status(401).json({
       success: false,
@@ -295,7 +292,7 @@ function telegramAuth(req, res, next) {
 }
 
 function rocketAuth(req, res, next) {
-  const initData = getTelegramInitData(req);
+  const initData = req.get('x-telegram-init-data');
   const telegramUser = verifyTelegramInitData(initData);
 
   if (!telegramUser) {
@@ -397,11 +394,20 @@ app.get('/', (req, res) => {
 app.get('/api/user/profile', userRequestAuth, async (req, res) => {
   try {
     const requestedUserId = req.query.userId ? String(req.query.userId) : '';
-    // userRequestAuth سبق أن تحقق من التوقيع ووضع الهوية الموثوقة هنا.
-    const verifiedTelegramUser = req.telegramUser;
-    const userId = String(verifiedTelegramUser.id);
+    const initData = req.get('x-telegram-init-data');
+    const verifiedTelegramUser = initData ? verifyTelegramInitData(initData) : null;
 
-    if (requestedUserId && requestedUserId !== userId) {
+    // إذا وصلت بيانات Telegram موقعة، فالمعرّف الموثوق يأتي منها لا من query string.
+    // نحافظ على التوافق القديم عند عدم إرسال initData، لكن لا نحدّث الاسم إلا ببيانات موثقة.
+    const userId = verifiedTelegramUser ? verifiedTelegramUser.id : requestedUserId;
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'تعذر تحديد المستخدم. افتح التطبيق من Telegram.'
+      });
+    }
+
+    if (verifiedTelegramUser && requestedUserId && requestedUserId !== verifiedTelegramUser.id) {
       return res.status(403).json({
         success: false,
         message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.'
@@ -1095,7 +1101,7 @@ app.get('/api/tasks', async (req, res) => {
   }
 });
 
-app.get('/api/tasks/list', async (req, res) => {
+app.get('/api/tasks/list', userRequestAuth, async (req, res) => {
   try {
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
 
@@ -1118,121 +1124,142 @@ app.get('/api/tasks/list', async (req, res) => {
   }
 });
 
-app.post('/api/tasks', userRequestAuth, async (req, res) => {
-  try {
-    const { title, platform, link, target, cost, creatorId } = req.body;
 
-    const newTask = new Task({
-      title,
-      platform,
-      link,
-      target: target || 50,
-      cost: cost || '1',
-      creatorId
-    });
-
-    await newTask.save();
-    res.status(201).json({ message: 'تم إنشاء المهمة بنجاح', task: newTask });
-  } catch (err) {
-    res.status(500).json({ error: 'فشل إنشاء المهمة' });
+async function createPaidTask(req, res, legacyRoute = false) {
+  const userId = String(req.telegramUser.id);
+  const { title, platform, link } = req.body;
+  const target = Number(legacyRoute ? (req.body.target ?? req.body.targetUsers ?? 50) : req.body.targetUsers);
+  if (typeof title !== 'string' || !title.trim() || typeof link !== 'string' ||
+      !Number.isInteger(target) || target < 50 || target > 10000 || target % 50 !== 0) {
+    return res.status(400).json({ success: false, message: 'بيانات المهمة غير صالحة؛ العدد يجب أن يكون من 50 إلى 10000 وبمضاعفات 50.' });
   }
+  let parsedUrl;
+  try { parsedUrl = new URL(link); } catch {
+    return res.status(400).json({ success: false, message: 'رابط المهمة غير صالح' });
+  }
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    return res.status(400).json({ success: false, message: 'يسمح بروابط HTTP وHTTPS فقط' });
+  }
+  const totalCost = target / 50; // $1 per 50 users; 10,000 users costs $200.
+  const session = await mongoose.startSession();
+  let createdTask;
+  try {
+    await session.withTransaction(async () => {
+      const chargedUser = await User.findOneAndUpdate(
+        { telegramId: userId, isBanned: { $ne: true }, balance: { $gte: totalCost } },
+        { $inc: { balance: -totalCost } },
+        { new: true, session }
+      );
+      if (!chargedUser) {
+        const existing = await User.findOne({ telegramId: userId }).session(session);
+        const e = new Error(!existing || existing.isBanned ? 'حساب محظور أو غير موجود' : `رصيد USD غير كافٍ. التكلفة المطلوبة: $${totalCost.toFixed(2)}`);
+        e.statusCode = !existing || existing.isBanned ? 403 : 400;
+        throw e;
+      }
+      const docs = await Task.create([{
+        title: title.trim().slice(0, 160),
+        platform: String(platform || 'Telegram').slice(0, 40),
+        link: parsedUrl.href, target, cost: totalCost.toFixed(2), creatorId: userId
+      }], { session });
+      createdTask = docs[0];
+    });
+    return res.status(201).json({ success: true, message: 'تم إنشاء المهمة بنجاح', task: createdTask, chargedUsd: totalCost });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    console.error('Task creation transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'فشل إنشاء المهمة بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally { await session.endSession(); }
+}
+
+app.post('/api/tasks', userRequestAuth, async (req, res) => {
+  try { return await createPaidTask(req, res, true); }
+  catch (err) { console.error('Legacy task route error:', err); return res.status(500).json({ success: false, message: 'فشل إنشاء المهمة' }); }
 });
 
 app.post('/api/tasks/create', userRequestAuth, async (req, res) => {
+  try { return await createPaidTask(req, res, false); }
+  catch (err) { console.error('Task creation error:', err); return res.status(500).json({ success: false, message: 'خطأ في إنشاء المهمة' }); }
+});
+
+app.post('/api/tasks/visit-ticket', userRequestAuth, async (req, res) => {
   try {
-    const { userId, title, platform, link, targetUsers, cost } = req.body;
-
-    if (!userId || !title || !link) {
-      return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
-    }
-
-    const user = await User.findOne({ telegramId: String(userId) });
-    if (!user || user.isBanned) {
-      return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
-    }
-
-    const totalCost = Number(cost) || 1;
-    if (totalCost <= 0 || user.balance < totalCost) {
-      return res.status(400).json({ success: false, message: 'رصيد USD غير كافٍ لإنشاء المهمة' });
-    }
-
-    user.balance -= totalCost;
-    await user.save();
-
-    const newTask = new Task({
-      title,
-      platform: platform || 'Telegram',
-      link,
-      target: Number(targetUsers) || 50,
-      cost: String(totalCost),
-      creatorId: String(userId)
-    });
-
-    await newTask.save();
-    res.json({ success: true, message: 'تم إنشاء المهمة بنجاح', task: newTask });
+    const userId = String(req.telegramUser.id);
+    const taskId = String(req.body.taskId || '');
+    if (!mongoose.isValidObjectId(taskId)) return res.status(400).json({ success: false, message: 'معرّف المهمة غير صالح' });
+    const task = await Task.findOne({ _id: taskId, status: { $ne: 'مكتملة' } }).lean();
+    if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة أو مكتملة' });
+    if (String(task.creatorId) === userId) return res.status(403).json({ success: false, message: 'لا يمكنك إكمال مهمتك الخاصة' });
+    if ((task.completedBy || []).map(String).includes(userId)) return res.status(400).json({ success: false, message: 'لقد أتممت هذه المهمة مسبقًا' });
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await TaskVisitTicket.create({ tokenHash, taskId: task._id, userId, expiresAt: new Date(Date.now() + 30 * 60 * 1000) });
+    const base = String(process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    return res.json({ success: true, visitUrl: `${base}/api/tasks/visit/redirect/${token}` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في إنشاء المهمة' });
+    console.error('Visit ticket error:', err);
+    return res.status(500).json({ success: false, message: 'تعذر تجهيز رابط الزيارة' });
+  }
+});
+
+app.get('/api/tasks/visit/redirect/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '');
+    if (!/^[a-f0-9]{64}$/.test(token)) return res.status(400).send('رابط الزيارة غير صالح');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const ticket = await TaskVisitTicket.findOneAndUpdate(
+      { tokenHash, usedAt: null, expiresAt: { $gt: new Date() } },
+      { $set: { usedAt: new Date() } }, { new: true }
+    );
+    if (!ticket) return res.status(410).send('انتهت صلاحية رابط الزيارة أو تم استخدامه');
+    const task = await Task.findById(ticket.taskId).lean();
+    if (!task) return res.status(410).send('المهمة لم تعد متاحة');
+    const destination = new URL(task.link);
+    if (!['http:', 'https:'].includes(destination.protocol)) return res.status(410).send('رابط المهمة غير صالح');
+    res.set('Cache-Control', 'no-store');
+    return res.redirect(302, destination.href);
+  } catch (err) {
+    console.error('Visit redirect error:', err);
+    return res.status(500).send('تعذر فتح رابط المهمة');
   }
 });
 
 app.post('/api/tasks/complete', userRequestAuth, async (req, res) => {
-  try {
-    const { userId, taskId, wasVisited } = req.body;
-
-    if (!userId || !taskId) {
-      return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
-    }
-
-    if (!wasVisited) {
-      return res.status(400).json({
-        success: false,
-        message: 'يجب الضغط على ابدأ التنفيذ وزيارة الرابط أولاً قبل استلام المكافأة'
-      });
-    }
-
-    const user = await User.findOne({ telegramId: String(userId) });
-    if (!user || user.isBanned) {
-      return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
-    }
-
-    const task = await Task.findById(taskId);
-    if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة' });
-
-    if (task.completedBy.includes(String(userId))) {
-      return res.status(400).json({ success: false, message: 'لقد أتممت هذه المهمة مسبقاً' });
-    }
-
-    // تحديث شرطي يمنع إتمام المهمة نفسها مرتين من طلبين متزامنين.
-    const updatedTask = await Task.findOneAndUpdate(
-      { _id: task._id, completedBy: { $ne: String(userId) }, status: { $ne: 'مكتملة' } },
-      {
-        $addToSet: { completedBy: String(userId) },
-        $inc: { current: 1 }
-      },
-      { new: true }
-    );
-
-    if (!updatedTask) {
-      return res.status(400).json({ success: false, message: 'المهمة مكتملة أو سبق لك إتمامها' });
-    }
-
-    if (updatedTask.current >= updatedTask.target) {
-      updatedTask.status = 'مكتملة';
-      await updatedTask.save();
-    }
-
-    user.gold = (user.gold || 0) + 1000;
-    await user.save();
-
-    res.json({
-      success: true,
-      rewardGold: 1000,
-      message: 'تم إتمام المهمة بنجاح! حصلت على 1000 ذهبة',
-      user: publicUser(user)
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في السيرفر' });
+  const userId = String(req.telegramUser.id);
+  const taskId = String(req.body.taskId || '');
+  const visitToken = String(req.body.visitToken || '');
+  if (!mongoose.isValidObjectId(taskId) || !/^[a-f0-9]{64}$/.test(visitToken)) {
+    return res.status(400).json({ success: false, message: 'يجب فتح رابط المهمة من زر الزيارة أولاً.' });
   }
+  const tokenHash = crypto.createHash('sha256').update(visitToken).digest('hex');
+  const session = await mongoose.startSession();
+  let updatedUser;
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findOne({ telegramId: userId, isBanned: { $ne: true } }).session(session);
+      if (!user) { const e = new Error('حساب محظور أو غير موجود'); e.statusCode = 403; throw e; }
+      const ticket = await TaskVisitTicket.findOneAndUpdate(
+        { tokenHash, taskId, userId, usedAt: { $ne: null }, expiresAt: { $gt: new Date() } },
+        { $set: { usedAt: new Date() } }, { new: true, session }
+      );
+      if (!ticket) { const e = new Error('لم يتم تسجيل زيارة صالحة لهذا الرابط. افتح المهمة من الزر ثم حاول مجددًا.'); e.statusCode = 400; throw e; }
+      const task = await Task.findOneAndUpdate(
+        { _id: taskId, creatorId: { $ne: userId }, completedBy: { $ne: userId }, status: { $ne: 'مكتملة' }, $expr: { $lt: ['$current', '$target'] } },
+        { $addToSet: { completedBy: userId }, $inc: { current: 1 } },
+        { new: true, session }
+      );
+      if (!task) { const e = new Error('المهمة مكتملة أو سبق لك إتمامها أو لا يمكنك إكمال مهمتك الخاصة'); e.statusCode = 400; throw e; }
+      if (task.current >= task.target) { task.status = 'مكتملة'; await task.save({ session }); }
+      updatedUser = await User.findOneAndUpdate(
+        { telegramId: userId, isBanned: { $ne: true } }, { $inc: { gold: 1000 } }, { new: true, session }
+      );
+      if (!updatedUser) { const e = new Error('تعذر تحديث رصيد المكافأة'); e.statusCode = 500; throw e; }
+    });
+    return res.json({ success: true, rewardGold: 1000, message: 'تم تسجيل زيارة الرابط وإتمام المهمة بنجاح! حصلت على 1000 ذهبة', user: publicUser(updatedUser) });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    console.error('Task completion transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر إتمام المهمة بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally { await session.endSession(); }
 });
 
 // --------------------------------------------------
