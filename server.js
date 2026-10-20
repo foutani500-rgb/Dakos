@@ -41,6 +41,8 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
 // مكافأة الإحالة الثابتة: 1000 Gold لكل مستخدم جديد تتم إحالته مرة واحدة فقط.
 const REFERRAL_REWARD_GOLD = 1000;
+// الصديق يُعد "نشطًا" إذا فتح التطبيق خلال آخر 7 أيام.
+const FRIEND_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 // إعدادات الصاروخ
 // هامش نظري مستهدف للعبة: 5% على المدى الطويل وفق نموذج الاحتمالات أدناه؛
@@ -69,6 +71,10 @@ const userSchema = new mongoose.Schema({
   // هوية المستخدم الذي أحال هذا المستخدم؛ تمنع احتساب الإحالة أكثر من مرة.
   referredBy: { type: String, default: null, index: true },
   referralRewardedAt: { type: Date, default: null },
+  // مكافآت الإحالة المعلّقة (تنتظر ضغط زر الاستلام) والمستلمة سابقًا.
+  pendingReferralGold: { type: Number, default: 0 },
+  totalReferralGold: { type: Number, default: 0 },
+  lastActiveAt: { type: Date, default: Date.now },
   isBanned: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
@@ -241,11 +247,25 @@ function verifyTelegramInitData(initData) {
 
     return {
       id: String(telegramUser.id),
-      first_name: telegramUser.first_name || ''
+      first_name: telegramUser.first_name || '',
+      // start_param موقّع ضمن initData، وفيه ref_<referrerId> عند الدخول من رابط إحالة.
+      start_param: params.get('start_param') || ''
     };
   } catch {
     return null;
   }
+}
+
+function telegramAuth(req, res, next) {
+  const telegramUser = verifyTelegramInitData(req.get('x-telegram-init-data'));
+  if (!telegramUser) {
+    return res.status(401).json({
+      success: false,
+      message: 'تعذر التحقق من حساب Telegram. افتح التطبيق من داخل Telegram.'
+    });
+  }
+  req.telegramUser = telegramUser;
+  next();
 }
 
 function rocketAuth(req, res, next) {
@@ -342,6 +362,8 @@ app.get('/api/user/profile', async (req, res) => {
     }
 
     let user = await User.findOne({ telegramId: userId });
+    // الإحالة تُحتسب فقط إذا أُنشئ الحساب الآن أثناء الدخول من رابط الإحالة.
+    const isNewUser = !user;
 
     if (!user) {
       user = new User({
@@ -363,7 +385,19 @@ app.get('/api/user/profile', async (req, res) => {
       });
     }
 
+    user.lastActiveAt = new Date();
     await user.save();
+
+    // تسجيل الإحالة تلقائيًا عند أول دخول عبر رابط ?startapp=ref_<id>.
+    const referrerFromLink = parseReferralParam(verifiedTelegramUser?.start_param);
+    if (isNewUser && referrerFromLink) {
+      try {
+        await registerReferral(user.telegramId, referrerFromLink);
+      } catch (refErr) {
+        console.error('auto referral error:', refErr.message);
+      }
+    }
+
     res.json({ success: true, user });
   } catch (err) {
     console.error('profile error:', err);
@@ -434,78 +468,165 @@ app.get('/api/referrals/stats', async (req, res) => {
   }
 });
 
-app.post('/api/user/referral', async (req, res) => {
+function parseReferralParam(value) {
+  const match = /^ref_(\d{1,20})$/.exec(String(value || '').trim());
+  return match ? match[1] : null;
+}
+
+// يربط المستخدم الجديد بالمُحيل مرة واحدة فقط، ويضيف المكافأة كرصيد معلّق للمُحيل.
+async function registerReferral(referredUserId, ownerId) {
+  referredUserId = String(referredUserId);
+  ownerId = String(ownerId);
+
+  if (!ownerId || referredUserId === ownerId) {
+    return { success: false, status: 400, message: 'رابط الإحالة غير صالح' };
+  }
+
+  const [referredUser, referrer] = await Promise.all([
+    User.findOne({ telegramId: referredUserId }),
+    User.findOne({ telegramId: ownerId })
+  ]);
+
+  if (!referredUser) return { success: false, status: 404, message: 'يجب إنشاء حساب المستخدم أولاً' };
+  if (!referrer || referrer.isBanned) return { success: false, status: 404, message: 'المُحيل غير موجود أو محظور' };
+  if (referredUser.isBanned) return { success: false, status: 403, message: 'المستخدم محظور' };
+  if (referredUser.referredBy || referredUser.referralRewardedAt) {
+    return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
+  }
+
+  // مطالبة ذرية تمنع احتساب الإحالة مرتين عند وصول طلبات متزامنة.
+  const claimedUser = await User.findOneAndUpdate(
+    {
+      telegramId: referredUserId,
+      isBanned: { $ne: true },
+      $and: [
+        { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
+        { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
+      ]
+    },
+    { $set: { referredBy: ownerId, referralRewardedAt: new Date() } },
+    { new: true }
+  );
+  if (!claimedUser) return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
+
+  const updatedReferrer = await User.findOneAndUpdate(
+    { telegramId: ownerId, isBanned: { $ne: true } },
+    { $inc: { referralCount: 1, pendingReferralGold: REFERRAL_REWARD_GOLD } },
+    { new: true }
+  );
+
+  if (!updatedReferrer) {
+    await User.updateOne(
+      { telegramId: referredUserId, referredBy: ownerId },
+      { $set: { referredBy: null, referralRewardedAt: null } }
+    );
+    return { success: false, status: 404, message: 'تعذر تحديث حساب المُحيل؛ حاول مجددًا' };
+  }
+
+  return {
+    success: true,
+    status: 200,
+    message: 'تم تسجيل الإحالة وإضافة المكافأة إلى رصيدك المعلّق',
+    reward: REFERRAL_REWARD_GOLD,
+    referralCount: updatedReferrer.referralCount,
+    pendingReward: updatedReferrer.pendingReferralGold
+  };
+}
+
+// التسجيل اليدوي للإحالة معطّل: الإحالة تُسجَّل فقط عند إنشاء الحساب الجديد
+// عبر /api/user/profile مع initData موقّع يحتوي start_param=ref_<id>.
+// هذا يمنع ربط مستخدمين فتحوا التطبيق سابقًا دون رابط إحالة.
+const referralRegistrationDisabled = (req, res) => {
+  res.status(410).json({
+    success: false,
+    message: 'تُحتسب الإحالة تلقائيًا فقط عند أول دخول للحساب الجديد عبر رابط الإحالة.'
+  });
+};
+app.post('/api/user/referral', referralRegistrationDisabled);
+app.post('/api/friends/register', referralRegistrationDisabled);
+
+async function friendsStatsFor(ownerId) {
+  const [owner, totalInvited] = await Promise.all([
+    User.findOne({ telegramId: ownerId }).select('pendingReferralGold totalReferralGold isBanned').lean(),
+    User.countDocuments({ referredBy: ownerId })
+  ]);
+  return {
+    owner,
+    stats: {
+      totalInvited,
+      totalEarnedGold: Math.max(0, Number(owner?.totalReferralGold) || 0),
+      pendingReward: Math.max(0, Number(owner?.pendingReferralGold) || 0)
+    }
+  };
+}
+
+app.get('/api/friends/list', telegramAuth, async (req, res) => {
   try {
-    const { userId, referrerId } = req.body;
-
-    if (!userId || !referrerId || String(userId) === String(referrerId)) {
-      return res.status(400).json({ success: false, message: 'خطأ في البيانات' });
+    const ownerId = req.telegramUser.id;
+    if (req.query.userId && String(req.query.userId) !== ownerId) {
+      return res.status(403).json({ success: false, message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.' });
     }
 
-    const referredUserId = String(userId);
-    const ownerId = String(referrerId);
+    const { owner, stats } = await friendsStatsFor(ownerId);
+    if (owner?.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
 
-    const [referredUser, referrer] = await Promise.all([
-      User.findOne({ telegramId: referredUserId }),
-      User.findOne({ telegramId: ownerId })
-    ]);
+    const friends = await User.find({ referredBy: ownerId })
+      .select('telegramId name createdAt lastActiveAt')
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
 
-    if (!referredUser) {
-      return res.status(404).json({ success: false, message: 'يجب إنشاء حساب المستخدم أولاً' });
-    }
-    if (!referrer || referrer.isBanned) {
-      return res.status(404).json({ success: false, message: 'المُحيل غير موجود أو محظور' });
-    }
-    if (referredUser.isBanned) {
-      return res.status(403).json({ success: false, message: 'المستخدم محظور' });
-    }
-    if (referredUser.referredBy || referredUser.referralRewardedAt) {
-      return res.status(409).json({ success: false, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' });
-    }
-
-    // مطالبة ذرية بالإحالة تمنع منح المكافأة مرتين عند وصول طلبات متزامنة.
-    const claimedUser = await User.findOneAndUpdate(
-      {
-        telegramId: referredUserId,
-        isBanned: { $ne: true },
-        $and: [
-          { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
-          { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
-        ]
-      },
-      { $set: { referredBy: ownerId, referralRewardedAt: new Date() } },
-      { new: true }
-    );
-
-    if (!claimedUser) {
-      return res.status(409).json({ success: false, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' });
-    }
-
-    const updatedReferrer = await User.findOneAndUpdate(
-      { telegramId: ownerId, isBanned: { $ne: true } },
-      { $inc: { referralCount: 1, gold: REFERRAL_REWARD_GOLD } },
-      { new: true }
-    );
-
-    if (!updatedReferrer) {
-      // إعادة فتح الإحالة إذا تعذر تحديث حساب المُحيل حتى يمكن إعادة المحاولة.
-      await User.updateOne(
-        { telegramId: referredUserId, referredBy: ownerId },
-        { $set: { referredBy: null, referralRewardedAt: null } }
-      );
-      return res.status(404).json({ success: false, message: 'تعذر تحديث حساب المُحيل؛ حاول مجددًا' });
-    }
-
-    return res.json({
+    const now = Date.now();
+    res.json({
       success: true,
-      message: `تم تسجيل الإحالة ومنح ${REFERRAL_REWARD_GOLD} Gold`,
-      reward: REFERRAL_REWARD_GOLD,
-      referralCount: updatedReferrer.referralCount,
-      gold: updatedReferrer.gold
+      friends: friends.map((friend) => ({
+        telegramId: friend.telegramId,
+        name: friend.name,
+        earnedGold: REFERRAL_REWARD_GOLD,
+        isActive: now - new Date(friend.lastActiveAt || friend.createdAt).getTime() <= FRIEND_ACTIVE_WINDOW_MS,
+        joinedAt: friend.createdAt
+      })),
+      stats,
+      rewardPerReferral: REFERRAL_REWARD_GOLD
     });
   } catch (err) {
-    console.error('referral registration error:', err);
-    res.status(500).json({ success: false, message: 'تعذر تسجيل الإحالة' });
+    console.error('friends list error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب قائمة الأصدقاء' });
+  }
+});
+
+app.post('/api/friends/claim', telegramAuth, async (req, res) => {
+  try {
+    const ownerId = req.telegramUser.id;
+    if (req.body?.userId && String(req.body.userId) !== ownerId) {
+      return res.status(403).json({ success: false, message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.' });
+    }
+
+    // تحديث ذري واحد: يصفّر المعلّق ويضيفه للذهب، فلا يمكن استلامه مرتين.
+    const before = await User.findOneAndUpdate(
+      { telegramId: ownerId, isBanned: { $ne: true }, pendingReferralGold: { $gt: 0 } },
+      [{
+        $set: {
+          gold: { $add: [{ $ifNull: ['$gold', 0] }, '$pendingReferralGold'] },
+          totalReferralGold: { $add: [{ $ifNull: ['$totalReferralGold', 0] }, '$pendingReferralGold'] },
+          pendingReferralGold: 0
+        }
+      }],
+      { new: false }
+    );
+
+    if (!before) {
+      return res.status(400).json({ success: false, message: 'لا توجد مكافآت معلّقة للاستلام حاليًا.' });
+    }
+
+    const claimedAmount = Number(before.pendingReferralGold) || 0;
+    const { stats } = await friendsStatsFor(ownerId);
+    const user = await User.findOne({ telegramId: ownerId });
+
+    res.json({ success: true, claimedAmount, stats, gold: user?.gold, user: publicUser(user) });
+  } catch (err) {
+    console.error('friends claim error:', err);
+    res.status(500).json({ success: false, message: 'تعذر استلام المكافأة' });
   }
 });
 
