@@ -5,8 +5,19 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
+app.disable('x-powered-by');
 
-app.use(cors());
+// يمكن تقييد مصادر المتصفح عبر CORS_ORIGINS مفصولة بفواصل في بيئة التشغيل.
+const configuredOrigins = (process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || configuredOrigins.length === 0 || configuredOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-telegram-init-data'],
+  maxAge: 600
+}));
 app.use(express.json({ limit: '100kb' }));
 
 // لا تضع بيانات MongoDB السرية مباشرة في الكود.
@@ -284,6 +295,36 @@ function rocketAuth(req, res, next) {
   next();
 }
 
+// يفرض هوية Telegram الموقعة على طلبات المستخدم، ولا يثق في userId المرسل من العميل.
+function userRequestAuth(req, res, next) {
+  return telegramAuth(req, res, () => {
+    const authenticatedId = String(req.telegramUser.id);
+    const claimedId = req.body?.userId ?? req.query?.userId;
+
+    if (claimedId != null && String(claimedId) !== authenticatedId) {
+      return res.status(403).json({
+        success: false,
+        message: 'معرّف المستخدم لا يطابق حساب Telegram الموثق.'
+      });
+    }
+
+    if (req.body && typeof req.body === 'object') {
+      req.body.userId = authenticatedId;
+    }
+    next();
+  });
+}
+
+// صلاحيات الإدارة لا تعتمد على adminId داخل الطلب؛ يجب أن تكون هوية Telegram الموقعة هي حساب الإدارة.
+function adminAuth(req, res, next) {
+  return telegramAuth(req, res, () => {
+    if (String(req.telegramUser.id) !== String(ADMIN_ID)) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+    next();
+  });
+}
+
 // المضاعف اللحظي؛ يتزايد مع الوقت.
 function calculateMultiplier(startedAt, now = Date.now()) {
   const elapsedSeconds = Math.max(0, (now - new Date(startedAt).getTime()) / 1000);
@@ -339,7 +380,7 @@ app.get('/', (req, res) => {
 // 1. ملف المستخدم
 // --------------------------------------------------
 
-app.get('/api/user/profile', async (req, res) => {
+app.get('/api/user/profile', userRequestAuth, async (req, res) => {
   try {
     const requestedUserId = req.query.userId ? String(req.query.userId) : '';
     const initData = req.get('x-telegram-init-data');
@@ -406,7 +447,7 @@ app.get('/api/user/profile', async (req, res) => {
   }
 });
 
-app.post('/api/user/update-currency', async (req, res) => {
+app.post('/api/user/update-currency', userRequestAuth, async (req, res) => {
   try {
     const { userId, currency } = req.body;
 
@@ -431,7 +472,7 @@ app.post('/api/user/update-currency', async (req, res) => {
 // 2. الإحالات
 // --------------------------------------------------
 
-app.get('/api/referrals/stats', async (req, res) => {
+app.get('/api/referrals/stats', userRequestAuth, async (req, res) => {
   try {
     const { userId } = req.query;
     if (!userId) {
@@ -635,7 +676,7 @@ app.post('/api/friends/claim', telegramAuth, async (req, res) => {
 // 3. المحفظة والتحويلات
 // --------------------------------------------------
 
-app.get('/api/wallet/details', async (req, res) => {
+app.get('/api/wallet/details', userRequestAuth, async (req, res) => {
   try {
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
@@ -676,7 +717,7 @@ app.get('/api/wallet/details', async (req, res) => {
   }
 });
 
-app.post('/api/wallet/exchange', async (req, res) => {
+app.post('/api/wallet/exchange', userRequestAuth, async (req, res) => {
   try {
     const { userId, type, amount } = req.body;
 
@@ -684,36 +725,42 @@ app.post('/api/wallet/exchange', async (req, res) => {
       return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
     }
 
-    const user = await User.findOne({ telegramId: String(userId) });
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
-
     const val = Number(amount);
+    let user = null;
 
     if (type === 'diamonds_to_gram') {
-      if (user.diamonds < val) {
-        return res.status(400).json({ success: false, message: 'رصيد الألماس غير كافٍ' });
-      }
-      user.diamonds -= val;
-      user.balance = (user.balance || 0) + val / 500;
+      user = await User.findOneAndUpdate(
+        { telegramId: String(userId), isBanned: { $ne: true }, diamonds: { $gte: val } },
+        { $inc: { diamonds: -val, balance: val / 500 } },
+        { new: true, runValidators: true }
+      );
     } else if (type === 'gold_to_diamonds') {
-      if (user.gold < val) {
-        return res.status(400).json({ success: false, message: 'رصيد الذهب غير كافٍ' });
+      if (val < 200) {
+        return res.status(400).json({ success: false, message: 'الحد الأدنى لتحويل الذهب إلى ألماس هو 200 ذهب' });
       }
-      user.gold -= val;
-      user.diamonds = (user.diamonds || 0) + Math.floor(val / 200);
+      user = await User.findOneAndUpdate(
+        { telegramId: String(userId), isBanned: { $ne: true }, gold: { $gte: val } },
+        { $inc: { gold: -val, diamonds: Math.floor(val / 200) } },
+        { new: true, runValidators: true }
+      );
     } else {
       return res.status(400).json({ success: false, message: 'نوع التحويل غير صالح' });
     }
 
-    await user.save();
+    if (!user) {
+      const exists = await User.findOne({ telegramId: String(userId) }).select('isBanned');
+      if (!exists) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+      if (exists.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ' });
+    }
+
     res.json({ success: true, message: 'تم التحويل بنجاح', user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في التحويل' });
   }
 });
 
-app.post('/api/wallet/convert', async (req, res) => {
+app.post('/api/wallet/convert', userRequestAuth, async (req, res) => {
   try {
     const { userId, amount } = req.body;
 
@@ -725,7 +772,11 @@ app.post('/api/wallet/convert', async (req, res) => {
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
 
-    res.json({ success: true, message: 'تم التحويل بنجاح' });
+    // لا توجد أسعار/دفاتر أرصدة موثوقة لكل الأصول في قاعدة البيانات؛ لا نُعلن نجاحًا وهميًا.
+    return res.status(501).json({
+      success: false,
+      message: 'التحويل بين هذه العملات غير متاح حاليًا؛ لم يتم خصم أو إضافة أي رصيد.'
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في التحويل الفوري' });
   }
@@ -739,11 +790,6 @@ const handleTransfer = async (req, res) => {
       return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
     }
 
-    const sender = await User.findOne({ telegramId: String(userId) });
-    if (!sender || sender.isBanned) {
-      return res.status(404).json({ success: false, message: 'المستخدم غير موجود أو محظور' });
-    }
-
     const transferAmount = Number(amount);
     const transferType = type || 'gold';
 
@@ -751,39 +797,61 @@ const handleTransfer = async (req, res) => {
       return res.status(400).json({ success: false, message: 'نوع الرصيد غير صالح' });
     }
 
-    if ((sender[transferType] || 0) < transferAmount) {
-      return res.status(400).json({ success: false, message: 'رصيدك غير كافٍ' });
-    }
-
     const targetId = recipientId || req.body.toUserId;
     if (!targetId || String(targetId) === String(userId)) {
       return res.status(400).json({ success: false, message: 'معرف المستلم غير صالح' });
     }
 
-    let recipient = await User.findOne({ telegramId: String(targetId) });
-    if (!recipient) recipient = new User({ telegramId: String(targetId) });
+    const sender = await User.findOneAndUpdate(
+      {
+        telegramId: String(userId),
+        isBanned: { $ne: true },
+        [transferType]: { $gte: transferAmount }
+      },
+      { $inc: { [transferType]: -transferAmount } },
+      { new: true }
+    );
 
-    if (recipient.isBanned) {
-      return res.status(400).json({ success: false, message: 'المستلم محظور' });
+    if (!sender) {
+      const existingSender = await User.findOne({ telegramId: String(userId) }).select('isBanned');
+      if (!existingSender) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+      if (existingSender.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
+      return res.status(400).json({ success: false, message: 'رصيدك غير كافٍ' });
     }
 
-    sender[transferType] -= transferAmount;
-    recipient[transferType] = (recipient[transferType] || 0) + transferAmount;
+    try {
+      const recipient = await User.findOneAndUpdate(
+        { telegramId: String(targetId), isBanned: { $ne: true } },
+        {
+          $inc: { [transferType]: transferAmount },
+          $setOnInsert: { name: 'زائر كريم' }
+        },
+        { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true }
+      );
 
-    await sender.save();
-    await recipient.save();
+      if (!recipient || recipient.isBanned) {
+        throw new Error('المستلم محظور أو غير متاح');
+      }
 
-    res.json({ success: true, message: 'تم التحويل بنجاح', sender: publicUser(sender) });
+      res.json({ success: true, message: 'تم التحويل بنجاح', sender: publicUser(sender) });
+    } catch (transferErr) {
+      // تعويض الخصم إذا تعذر إيداع المبلغ للمستلم.
+      await User.updateOne({ telegramId: String(userId) }, { $inc: { [transferType]: transferAmount } });
+      if (transferErr.message === 'المستلم محظور أو غير متاح') {
+        return res.status(400).json({ success: false, message: 'المستلم محظور أو غير متاح' });
+      }
+      throw transferErr;
+    }
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في عملية التحويل' });
   }
 };
 
-app.post('/api/user/transfer', handleTransfer);
-app.post('/api/transfer', handleTransfer);
-app.post('/api/wallet/transfer', handleTransfer);
+app.post('/api/user/transfer', userRequestAuth, handleTransfer);
+app.post('/api/transfer', userRequestAuth, handleTransfer);
+app.post('/api/wallet/transfer', userRequestAuth, handleTransfer);
 
-app.post('/api/wallet/deposit', async (req, res) => {
+app.post('/api/wallet/deposit', userRequestAuth, async (req, res) => {
   try {
     const { userId, amount, method, txId } = req.body;
 
@@ -797,12 +865,12 @@ app.post('/api/wallet/deposit', async (req, res) => {
     }
 
     const newTx = new Transaction({
-      txId: txId || `DEP-${crypto.randomInt(100000, 1000000)}`,
+      txId: `DEP-${crypto.randomBytes(12).toString('hex')}`,
       userId: String(userId),
       type: 'إيداع',
       amount: Number(amount),
       method: (method || 'BINANCE').toUpperCase(),
-      details: `TxID: ${txId || 'N/A'}`,
+      details: `TxID: ${String(txId || 'N/A').slice(0, 300)}`,
       status: 'pending'
     });
 
@@ -813,7 +881,7 @@ app.post('/api/wallet/deposit', async (req, res) => {
   }
 });
 
-app.post('/api/admin/deposit-notify', async (req, res) => {
+app.post('/api/admin/deposit-notify', adminAuth, async (req, res) => {
   try {
     const { userId, amount, method, details } = req.body;
     if (!userId || !isValidPositiveNumber(amount)) {
@@ -836,7 +904,7 @@ app.post('/api/admin/deposit-notify', async (req, res) => {
   }
 });
 
-app.post('/api/admin/withdraw-notify', async (req, res) => {
+app.post('/api/admin/withdraw-notify', adminAuth, async (req, res) => {
   try {
     const { userId, amount, method, details } = req.body;
     if (!userId || !isValidPositiveNumber(amount)) {
@@ -859,7 +927,7 @@ app.post('/api/admin/withdraw-notify', async (req, res) => {
   }
 });
 
-app.post('/api/wallet/withdraw', async (req, res) => {
+app.post('/api/wallet/withdraw', userRequestAuth, async (req, res) => {
   try {
     const { userId, amount, method, details } = req.body;
 
@@ -873,18 +941,34 @@ app.post('/api/wallet/withdraw', async (req, res) => {
       return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ أو الحساب محظور' });
     }
 
+    const withdrawalAmount = Number(amount);
+    const reservedUser = await User.findOneAndUpdate(
+      { telegramId: String(userId), isBanned: { $ne: true }, balance: { $gte: withdrawalAmount } },
+      { $inc: { balance: -withdrawalAmount } },
+      { new: true }
+    );
+
+    if (!reservedUser) {
+      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ أو الحساب محظور' });
+    }
+
     const newTx = new Transaction({
-      txId: `WIT-${crypto.randomInt(100000, 1000000)}`,
+      txId: `WIT-${crypto.randomBytes(12).toString('hex')}`,
       userId: String(userId),
       type: 'سحب',
-      amount: Number(amount),
+      amount: withdrawalAmount,
       method: (method || 'BANK').toUpperCase(),
       details: details || 'طلب سحب',
       status: 'pending'
     });
 
-    await newTx.save();
-    res.json({ success: true, message: 'تم إرسال طلب السحب بنجاح للمراجعة' });
+    try {
+      await newTx.save();
+    } catch (saveErr) {
+      await User.updateOne({ telegramId: String(userId) }, { $inc: { balance: withdrawalAmount } });
+      throw saveErr;
+    }
+    res.json({ success: true, message: 'تم إرسال طلب السحب بنجاح للمراجعة. تم حجز المبلغ حتى تتم المراجعة.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في عملية السحب' });
   }
@@ -959,10 +1043,10 @@ async function redeemPromo(req, res, responseKey = 'reward') {
   }
 }
 
-app.post('/api/promo/redeem', (req, res) => redeemPromo(req, res, 'reward'));
-app.post('/api/promo/apply', (req, res) => redeemPromo(req, res, 'goldReward'));
+app.post('/api/promo/redeem', userRequestAuth, (req, res) => redeemPromo(req, res, 'reward'));
+app.post('/api/promo/apply', userRequestAuth, (req, res) => redeemPromo(req, res, 'goldReward'));
 
-app.post('/api/promo/create', async (req, res) => {
+app.post('/api/promo/create', userRequestAuth, async (req, res) => {
   try {
     const { userId, code, maxUses, goldRewardPerPerson } = req.body;
 
@@ -1029,7 +1113,7 @@ app.get('/api/tasks/list', async (req, res) => {
   }
 });
 
-app.post('/api/tasks', async (req, res) => {
+app.post('/api/tasks', userRequestAuth, async (req, res) => {
   try {
     const { title, platform, link, target, cost, creatorId } = req.body;
 
@@ -1049,7 +1133,7 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
-app.post('/api/tasks/create', async (req, res) => {
+app.post('/api/tasks/create', userRequestAuth, async (req, res) => {
   try {
     const { userId, title, platform, link, targetUsers, cost } = req.body;
 
@@ -1086,7 +1170,7 @@ app.post('/api/tasks/create', async (req, res) => {
   }
 });
 
-app.post('/api/tasks/complete', async (req, res) => {
+app.post('/api/tasks/complete', userRequestAuth, async (req, res) => {
   try {
     const { userId, taskId, wasVisited } = req.body;
 
@@ -1426,7 +1510,7 @@ app.post('/api/games/rocket/play', (req, res) => {
 // أبقيت سلوك المسارات القديمة للتوافق، ويلزم تأمينها لاحقًا.
 // --------------------------------------------------
 
-app.get('/api/admin/dashboard', async (req, res) => {
+app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
   try {
     if (String(req.query.adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
@@ -1480,7 +1564,7 @@ app.get('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-app.post('/api/admin/process-transaction', async (req, res) => {
+app.post('/api/admin/process-transaction', adminAuth, async (req, res) => {
   try {
     const { adminId, txId, action } = req.body;
 
@@ -1513,6 +1597,11 @@ app.post('/api/admin/process-transaction', async (req, res) => {
         { telegramId: tx.userId },
         { $inc: { balance: tx.amount } }
       );
+    } else if (action === 'reject' && tx.type === 'سحب') {
+      await User.updateOne(
+        { telegramId: tx.userId },
+        { $inc: { balance: tx.amount } }
+      );
     }
 
     res.json({
@@ -1524,7 +1613,7 @@ app.post('/api/admin/process-transaction', async (req, res) => {
   }
 });
 
-app.get('/api/admin/rocket', async (req, res) => {
+app.get('/api/admin/rocket', adminAuth, async (req, res) => {
   try {
     if (String(req.query.adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
@@ -1574,7 +1663,7 @@ app.get('/api/admin/rocket', async (req, res) => {
   }
 });
 
-app.post('/api/admin/update-rocket', async (req, res) => {
+app.post('/api/admin/update-rocket', adminAuth, async (req, res) => {
   try {
     if (String(req.body.adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
@@ -1600,7 +1689,7 @@ app.post('/api/admin/update-rocket', async (req, res) => {
   }
 });
 
-app.post('/api/admin/user-ban', async (req, res) => {
+app.post('/api/admin/user-ban', adminAuth, async (req, res) => {
   try {
     const { adminId, targetUserId, action } = req.body;
 
@@ -1623,7 +1712,7 @@ app.post('/api/admin/user-ban', async (req, res) => {
   }
 });
 
-app.post('/api/admin/modify-balance', async (req, res) => {
+app.post('/api/admin/modify-balance', adminAuth, async (req, res) => {
   try {
     const { adminId, targetUserId, amount, type, action } = req.body;
 
@@ -1661,7 +1750,7 @@ app.post('/api/admin/modify-balance', async (req, res) => {
   }
 });
 
-app.post('/api/admin/delete-task', async (req, res) => {
+app.post('/api/admin/delete-task', adminAuth, async (req, res) => {
   try {
     const { adminId, taskId } = req.body;
 
@@ -1676,7 +1765,7 @@ app.post('/api/admin/delete-task', async (req, res) => {
   }
 });
 
-app.post('/api/admin/create-promo', async (req, res) => {
+app.post('/api/admin/create-promo', adminAuth, async (req, res) => {
   try {
     const { adminId, code, maxUses, goldRewardPerPerson, amount, type } = req.body;
 
@@ -1714,7 +1803,7 @@ app.post('/api/admin/create-promo', async (req, res) => {
   }
 });
 
-app.post('/api/admin/delete-promo', async (req, res) => {
+app.post('/api/admin/delete-promo', adminAuth, async (req, res) => {
   try {
     const { adminId, code } = req.body;
 
