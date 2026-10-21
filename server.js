@@ -464,7 +464,7 @@ app.get('/api/user/profile', userRequestAuth, async (req, res) => {
 
     let user = await User.findOne({ telegramId: userId });
     // الإحالة تُحتسب فقط إذا أُنشئ الحساب الآن أثناء الدخول من رابط الإحالة.
-    const isNewUser = !user;
+    let isNewUser = !user;
 
     if (!user) {
       user = new User({
@@ -487,13 +487,29 @@ app.get('/api/user/profile', userRequestAuth, async (req, res) => {
     }
 
     user.lastActiveAt = new Date();
-    await user.save();
+    try {
+      await user.save();
+    } catch (saveErr) {
+      // قد يفتح المستخدم التطبيق بطلبين متزامنين لأول مرة؛ منع خطأ 500 بسبب unique telegramId.
+      if (saveErr?.code === 11000 && isNewUser) {
+        user = await User.findOne({ telegramId: userId });
+        if (!user) throw saveErr;
+        user.lastActiveAt = new Date();
+        await user.save();
+        isNewUser = false;
+      } else {
+        throw saveErr;
+      }
+    }
 
     // تسجيل الإحالة تلقائيًا عند أول دخول عبر رابط ?startapp=ref_<id>.
     const referrerFromLink = parseReferralParam(verifiedTelegramUser?.start_param);
     if (isNewUser && referrerFromLink) {
       try {
-        await registerReferral(user.telegramId, referrerFromLink);
+        const referralResult = await registerReferral(user.telegramId, referrerFromLink);
+        if (!referralResult?.success) {
+          console.warn('auto referral not registered:', referralResult?.status || 'unknown', referralResult?.message || 'unknown reason');
+        }
       } catch (refErr) {
         console.error('auto referral error:', refErr.message);
       }
@@ -583,55 +599,60 @@ async function registerReferral(referredUserId, ownerId) {
     return { success: false, status: 400, message: 'رابط الإحالة غير صالح' };
   }
 
-  const [referredUser, referrer] = await Promise.all([
-    User.findOne({ telegramId: referredUserId }),
-    User.findOne({ telegramId: ownerId })
-  ]);
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      const [referredUser, referrer] = await Promise.all([
+        User.findOne({ telegramId: referredUserId }).session(session),
+        User.findOne({ telegramId: ownerId }).session(session)
+      ]);
 
-  if (!referredUser) return { success: false, status: 404, message: 'يجب إنشاء حساب المستخدم أولاً' };
-  if (!referrer || referrer.isBanned) return { success: false, status: 404, message: 'المُحيل غير موجود أو محظور' };
-  if (referredUser.isBanned) return { success: false, status: 403, message: 'المستخدم محظور' };
-  if (referredUser.referredBy || referredUser.referralRewardedAt) {
-    return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
+      if (!referredUser) { const e = new Error('يجب إنشاء حساب المستخدم أولاً'); e.statusCode = 404; throw e; }
+      if (!referrer || referrer.isBanned) { const e = new Error('المُحيل غير موجود أو محظور'); e.statusCode = 404; throw e; }
+      if (referredUser.isBanned) { const e = new Error('المستخدم محظور'); e.statusCode = 403; throw e; }
+      if (referredUser.referredBy || referredUser.referralRewardedAt) {
+        const e = new Error('تم تسجيل إحالة هذا المستخدم مسبقًا'); e.statusCode = 409; throw e;
+      }
+
+      const claimedUser = await User.findOneAndUpdate(
+        {
+          telegramId: referredUserId,
+          isBanned: { $ne: true },
+          $and: [
+            { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
+            { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
+          ]
+        },
+        { $set: { referredBy: ownerId, referralRewardedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!claimedUser) { const e = new Error('تم تسجيل إحالة هذا المستخدم مسبقًا'); e.statusCode = 409; throw e; }
+
+      const updatedReferrer = await User.findOneAndUpdate(
+        { telegramId: ownerId, isBanned: { $ne: true } },
+        { $inc: { referralCount: 1, pendingReferralGold: REFERRAL_REWARD_GOLD } },
+        { new: true, session }
+      );
+      if (!updatedReferrer) { const e = new Error('تعذر تحديث حساب المُحيل'); e.statusCode = 404; throw e; }
+
+      result = {
+        success: true,
+        status: 200,
+        message: 'تم تسجيل الإحالة وإضافة المكافأة إلى رصيدك المعلّق',
+        reward: REFERRAL_REWARD_GOLD,
+        referralCount: updatedReferrer.referralCount,
+        pendingReward: updatedReferrer.pendingReferralGold
+      };
+    });
+    return result;
+  } catch (err) {
+    if (err.statusCode) return { success: false, status: err.statusCode, message: err.message };
+    console.error('referral transaction failed:', err);
+    throw err;
+  } finally {
+    await session.endSession();
   }
-
-  // مطالبة ذرية تمنع احتساب الإحالة مرتين عند وصول طلبات متزامنة.
-  const claimedUser = await User.findOneAndUpdate(
-    {
-      telegramId: referredUserId,
-      isBanned: { $ne: true },
-      $and: [
-        { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
-        { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
-      ]
-    },
-    { $set: { referredBy: ownerId, referralRewardedAt: new Date() } },
-    { new: true }
-  );
-  if (!claimedUser) return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
-
-  const updatedReferrer = await User.findOneAndUpdate(
-    { telegramId: ownerId, isBanned: { $ne: true } },
-    { $inc: { referralCount: 1, pendingReferralGold: REFERRAL_REWARD_GOLD } },
-    { new: true }
-  );
-
-  if (!updatedReferrer) {
-    await User.updateOne(
-      { telegramId: referredUserId, referredBy: ownerId },
-      { $set: { referredBy: null, referralRewardedAt: null } }
-    );
-    return { success: false, status: 404, message: 'تعذر تحديث حساب المُحيل؛ حاول مجددًا' };
-  }
-
-  return {
-    success: true,
-    status: 200,
-    message: 'تم تسجيل الإحالة وإضافة المكافأة إلى رصيدك المعلّق',
-    reward: REFERRAL_REWARD_GOLD,
-    referralCount: updatedReferrer.referralCount,
-    pendingReward: updatedReferrer.pendingReferralGold
-  };
 }
 
 // التسجيل اليدوي للإحالة معطّل: الإحالة تُسجَّل فقط عند إنشاء الحساب الجديد
@@ -1197,67 +1218,57 @@ app.post('/api/wallet/exchange', userRequestAuth, walletConversionHandler);
 app.post('/api/wallet/convert', userRequestAuth, walletConversionHandler);
 
 const handleTransfer = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { userId, recipientId, amount, type } = req.body;
-
     if (!userId || !isValidPositiveNumber(amount)) {
       return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
     }
 
     const transferAmount = Number(amount);
     const transferType = type || 'gold';
-
-    if (!['gold', 'diamonds', 'balance'].includes(transferType)) {
-      return res.status(400).json({ success: false, message: 'نوع الرصيد غير صالح' });
+    if (!Number.isFinite(transferAmount) || transferAmount <= 0 || !['gold', 'diamonds', 'balance'].includes(transferType)) {
+      return res.status(400).json({ success: false, message: 'نوع الرصيد أو المبلغ غير صالح' });
     }
 
-    const targetId = recipientId || req.body.toUserId;
-    if (!targetId || String(targetId) === String(userId)) {
+    const targetId = String(recipientId || req.body.toUserId || '');
+    if (!targetId || targetId === String(userId)) {
       return res.status(400).json({ success: false, message: 'معرف المستلم غير صالح' });
     }
 
-    const sender = await User.findOneAndUpdate(
-      {
-        telegramId: String(userId),
-        isBanned: { $ne: true },
-        [transferType]: { $gte: transferAmount }
-      },
-      { $inc: { [transferType]: -transferAmount } },
-      { new: true }
-    );
-
-    if (!sender) {
-      const existingSender = await User.findOne({ telegramId: String(userId) }).select('isBanned');
-      if (!existingSender) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-      if (existingSender.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
-      return res.status(400).json({ success: false, message: 'رصيدك غير كافٍ' });
-    }
-
-    try {
-      const recipient = await User.findOneAndUpdate(
-        { telegramId: String(targetId), isBanned: { $ne: true } },
-        {
-          $inc: { [transferType]: transferAmount },
-          $setOnInsert: { name: 'زائر كريم' }
-        },
-        { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true }
+    let updatedSender;
+    await session.withTransaction(async () => {
+      updatedSender = await User.findOneAndUpdate(
+        { telegramId: String(userId), isBanned: { $ne: true }, [transferType]: { $gte: transferAmount } },
+        { $inc: { [transferType]: -transferAmount } },
+        { new: true, session }
       );
-
-      if (!recipient || recipient.isBanned) {
-        throw new Error('المستلم محظور أو غير متاح');
+      if (!updatedSender) {
+        const existingSender = await User.findOne({ telegramId: String(userId) }).select('isBanned').session(session);
+        const e = new Error(!existingSender ? 'المستخدم غير موجود' : existingSender.isBanned ? 'حساب محظور' : 'رصيدك غير كافٍ');
+        e.statusCode = !existingSender ? 404 : existingSender.isBanned ? 403 : 400;
+        throw e;
       }
 
-      res.json({ success: true, message: 'تم التحويل بنجاح', sender: publicUser(sender) });
-    } catch (transferErr) {
-      // تعويض الخصم إذا تعذر إيداع المبلغ للمستلم.
-      await User.updateOne({ telegramId: String(userId) }, { $inc: { [transferType]: transferAmount } });
-      if (transferErr.message === 'المستلم محظور أو غير متاح') {
-        return res.status(400).json({ success: false, message: 'المستلم محظور أو غير متاح' });
+      const recipient = await User.findOneAndUpdate(
+        { telegramId: targetId, isBanned: { $ne: true } },
+        { $inc: { [transferType]: transferAmount } },
+        { new: true, session }
+      );
+      if (!recipient) {
+        const e = new Error('المستلم محظور أو غير موجود');
+        e.statusCode = 400;
+        throw e;
       }
-      throw transferErr;
-    }
+    });
+
+    return res.json({ success: true, message: 'تم التحويل بنجاح', sender: publicUser(updatedSender) });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في عملية التحويل' });
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    console.error('transfer transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر إتمام التحويل بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally {
+    await session.endSession();
   }
 };
 
@@ -1342,49 +1353,51 @@ app.post('/api/admin/withdraw-notify', adminAuth, async (req, res) => {
 });
 
 app.post('/api/wallet/withdraw', userRequestAuth, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { userId, amount, method, details } = req.body;
-
     if (!userId || !isValidPositiveNumber(amount) || Number(amount) < 10) {
       return res.status(400).json({ success: false, message: 'الحد الأدنى للسحب هو 10$' });
     }
 
-    const user = await User.findOne({ telegramId: String(userId) });
-
-    if (!user || user.isBanned || user.balance < Number(amount)) {
-      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ أو الحساب محظور' });
-    }
-
     const withdrawalAmount = Number(amount);
-    const reservedUser = await User.findOneAndUpdate(
-      { telegramId: String(userId), isBanned: { $ne: true }, balance: { $gte: withdrawalAmount } },
-      { $inc: { balance: -withdrawalAmount } },
-      { new: true }
-    );
-
-    if (!reservedUser) {
-      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ أو الحساب محظور' });
+    if (!Number.isFinite(withdrawalAmount) || withdrawalAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'مبلغ السحب غير صالح' });
     }
 
-    const newTx = new Transaction({
-      txId: `WIT-${crypto.randomBytes(12).toString('hex')}`,
-      userId: String(userId),
-      type: 'سحب',
-      amount: withdrawalAmount,
-      method: (method || 'BANK').toUpperCase(),
-      details: details || 'طلب سحب',
-      status: 'pending'
+    let txId;
+    await session.withTransaction(async () => {
+      const reservedUser = await User.findOneAndUpdate(
+        { telegramId: String(userId), isBanned: { $ne: true }, balance: { $gte: withdrawalAmount } },
+        { $inc: { balance: -withdrawalAmount } },
+        { new: true, session }
+      );
+      if (!reservedUser) {
+        const existing = await User.findOne({ telegramId: String(userId) }).select('isBanned').session(session);
+        const e = new Error(!existing ? 'حساب غير موجود' : existing.isBanned ? 'حساب محظور' : 'الرصيد غير كافٍ');
+        e.statusCode = !existing || existing.isBanned ? 403 : 400;
+        throw e;
+      }
+
+      txId = `WIT-${crypto.randomBytes(12).toString('hex')}`;
+      await new Transaction({
+        txId,
+        userId: String(userId),
+        type: 'سحب',
+        amount: withdrawalAmount,
+        method: String(method || 'BANK').toUpperCase().slice(0, 40),
+        details: String(details || 'طلب سحب').slice(0, 1000),
+        status: 'pending'
+      }).save({ session });
     });
 
-    try {
-      await newTx.save();
-    } catch (saveErr) {
-      await User.updateOne({ telegramId: String(userId) }, { $inc: { balance: withdrawalAmount } });
-      throw saveErr;
-    }
-    res.json({ success: true, message: 'تم إرسال طلب السحب بنجاح للمراجعة. تم حجز المبلغ حتى تتم المراجعة.' });
+    return res.json({ success: true, txId, message: 'تم إرسال طلب السحب للمراجعة، وحُجز المبلغ حتى تتم المراجعة.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في عملية السحب' });
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    console.error('withdraw transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر إنشاء طلب السحب بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -1675,7 +1688,10 @@ const taskVerifyCooldown = new Map();
 
 app.get('/api/tasks', async (req, res) => {
   try {
-    const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
+    // لا نُرجع معرّفات منشئي المهام أو قائمة هويات جميع من أكملوها إلى مسار عام.
+    const tasks = await Task.find({ status: { $ne: 'مكتملة' } })
+      .select('_id title platform link current target cost status createdAt')
+      .sort({ createdAt: -1 }).lean();
     res.json(tasks);
   } catch (err) {
     res.status(500).json({ error: 'خطأ في جلب المهام' });
@@ -1698,7 +1714,8 @@ app.get('/api/tasks/list', userRequestAuth, async (req, res) => {
         current: t.current,
         rewardGold: TASK_REWARD_GOLD,
         verifiable: !!extractTelegramChat(t.link),
-        completedBy: t.completedBy
+        // توافق مع الواجهة: نكشف حالة إتمام المستخدم الحالي فقط، لا هويات بقية المستخدمين.
+        completedBy: (t.completedBy || []).map(String).includes(String(req.telegramUser.id)) ? [String(req.telegramUser.id)] : []
       }))
     });
   } catch (err) {
@@ -2094,6 +2111,7 @@ app.post('/api/games/rocket/state', rocketAuth, async (req, res) => {
 // هذا المسار يسمح برهان واحد أو رهانيْن في خانتي الواجهة خلال نافذة المراهنة.
 // يمكن للصاروخ أن يعمل دون أي رهانات؛ وجود رهان ليس شرطًا لإنشاء الجولة أو تحريكها.
 app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const userId = req.telegramUser.id;
     const betAmount = Number(req.body.betAmount);
@@ -2105,48 +2123,64 @@ app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'خانة الرهان غير صالحة' });
     }
 
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
-
     const round = await ensurePublicRocketRound();
     if (round.status !== 'betting' || Date.now() >= new Date(round.bettingEndsAt).getTime()) {
       return res.status(409).json({ success: false, message: 'بدأ صعود الصاروخ؛ انتظر الجولة التالية', roundId: round.roundId });
     }
-    if (await RocketBet.findOne({ roundId: round.roundId, userId, betSlot })) {
-      return res.status(409).json({ success: false, message: 'وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة' });
-    }
 
-    const updatedUser = await User.findOneAndUpdate(
-      { telegramId: userId, isBanned: false, gold: { $gte: betAmount } },
-      { $inc: { gold: -betAmount } },
-      { new: true }
-    );
-    if (!updatedUser) return res.status(400).json({ success: false, message: 'رصيدك من الذهب غير كافٍ' });
-
+    let updatedUser;
     let bet;
-    try {
-      bet = await new RocketBet({ roundId: round.roundId, userId, betSlot, betAmount, status: 'active' }).save();
-    } catch (err) {
-      await User.updateOne({ telegramId: userId }, { $inc: { gold: betAmount } });
-      if (err.code === 11000) return res.status(409).json({ success: false, message: 'وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة' });
-      throw err;
-    }
+    await session.withTransaction(async () => {
+      const currentRound = await PublicRocketRound.findOne({
+        _id: round._id, status: 'betting', bettingEndsAt: { $gt: new Date() }
+      }).session(session);
+      if (!currentRound) {
+        const e = new Error('بدأ صعود الصاروخ؛ انتظر الجولة التالية');
+        e.statusCode = 409;
+        throw e;
+      }
+
+      const existingBet = await RocketBet.findOne({ roundId: round.roundId, userId, betSlot }).session(session);
+      if (existingBet) {
+        const e = new Error('وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة');
+        e.statusCode = 409;
+        throw e;
+      }
+
+      updatedUser = await User.findOneAndUpdate(
+        { telegramId: userId, isBanned: { $ne: true }, gold: { $gte: betAmount } },
+        { $inc: { gold: -betAmount } },
+        { new: true, session }
+      );
+      if (!updatedUser) {
+        const existingUser = await User.findOne({ telegramId: userId }).select('isBanned').session(session);
+        const e = new Error(!existingUser ? 'المستخدم غير موجود' : existingUser.isBanned ? 'حساب محظور' : 'رصيدك من الذهب غير كافٍ');
+        e.statusCode = !existingUser || existingUser.isBanned ? 403 : 400;
+        throw e;
+      }
+
+      bet = new RocketBet({ roundId: round.roundId, userId, betSlot, betAmount, status: 'active' });
+      await bet.save({ session });
+    });
 
     const payload = await rocketRoundPayload(round, userId);
     return res.status(201).json({
       success: true, message: 'تم تسجيل رهانك في الجولة المشتركة', balance: updatedUser.gold,
-      round: payload.round, bets: payload.bets, bet: {
-        betId: String(bet._id), roundId: bet.roundId, betSlot: bet.betSlot, betAmount: bet.betAmount, status: bet.status
-      }
+      round: payload.round, bets: payload.bets,
+      bet: { betId: String(bet._id), roundId: bet.roundId, betSlot: bet.betSlot, betAmount: bet.betAmount, status: bet.status }
     });
   } catch (err) {
-    console.error('rocket start error:', err);
-    return res.status(500).json({ success: false, message: 'تعذر تسجيل رهان الصاروخ' });
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    if (err && err.code === 11000) return res.status(409).json({ success: false, message: 'وضعت رهانًا بالفعل في هذه الخانة لهذه الجولة' });
+    console.error('rocket start transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر تسجيل الرهان بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally {
+    await session.endSession();
   }
 });
 
 app.post('/api/games/rocket/cashout', rocketAuth, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const userId = req.telegramUser.id;
     const { roundId, betId, betSlot } = req.body;
@@ -2154,38 +2188,52 @@ app.post('/api/games/rocket/cashout', rocketAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'معرف الجولة غير صالح' });
     }
 
-    const round = await PublicRocketRound.findOne({ roundId });
-    if (!round) return res.status(404).json({ success: false, message: 'الجولة غير موجودة' });
     await ensurePublicRocketRound();
     const now = new Date();
-    if (round.status !== 'running' || !round.crashAt || now >= round.crashAt) {
-      return res.status(409).json({ success: false, crashed: true, message: 'انفجر الصاروخ أو انتهت الجولة قبل السحب', crashMultiplier: round.status === 'crashed' ? round.crashMultiplier : undefined });
-    }
+    let round;
+    let claimedBet;
+    let updatedUser;
+    let multiplier;
+    let wonAmount;
 
-    const filter = { roundId, userId, status: 'active' };
-    if (betId) filter._id = betId;
-    else if (betSlot != null) filter.betSlot = Number(betSlot);
-    const bet = await RocketBet.findOne(filter);
-    if (!bet) return res.status(404).json({ success: false, message: 'لا يوجد رهان نشط لك في هذه الخانة' });
+    await session.withTransaction(async () => {
+      round = await PublicRocketRound.findOne({ roundId }).session(session);
+      if (!round) {
+        const e = new Error('الجولة غير موجودة'); e.statusCode = 404; throw e;
+      }
+      if (round.status !== 'running' || !round.crashAt || now >= round.crashAt) {
+        const e = new Error('انفجر الصاروخ أو انتهت الجولة قبل السحب');
+        e.statusCode = 409; e.crashed = true; throw e;
+      }
 
-    const multiplier = Math.min(calculateMultiplier(round.startedAt, now.getTime()), round.crashMultiplier);
-    const wonAmount = Math.floor(bet.betAmount * multiplier);
-    const claimedBet = await RocketBet.findOneAndUpdate(
-      { _id: bet._id, status: 'active' },
-      { $set: { status: 'cashed_out', cashOutMultiplier: multiplier, wonAmount, cashedOutAt: now } },
-      { new: true }
-    );
-    if (!claimedBet) return res.status(409).json({ success: false, message: 'تمت تسوية هذا الرهان مسبقًا' });
+      const filter = { roundId, userId, status: 'active' };
+      if (betId) filter._id = betId;
+      else if (betSlot != null) filter.betSlot = Number(betSlot);
+      const bet = await RocketBet.findOne(filter).session(session);
+      if (!bet) {
+        const e = new Error('لا يوجد رهان نشط لك في هذه الخانة'); e.statusCode = 404; throw e;
+      }
 
-    const updatedUser = await User.findOneAndUpdate(
-      { telegramId: userId, isBanned: false },
-      { $inc: { gold: wonAmount } },
-      { new: true }
-    );
-    if (!updatedUser) {
-      console.error('CRITICAL: rocket bet cashed out but balance update failed', bet._id);
-      return res.status(500).json({ success: false, message: 'سُجل السحب لكن تعذر تحديث الرصيد؛ تواصل مع الدعم' });
-    }
+      multiplier = Math.min(calculateMultiplier(round.startedAt, now.getTime()), round.crashMultiplier);
+      wonAmount = Math.floor(bet.betAmount * multiplier);
+      claimedBet = await RocketBet.findOneAndUpdate(
+        { _id: bet._id, status: 'active' },
+        { $set: { status: 'cashed_out', cashOutMultiplier: multiplier, wonAmount, cashedOutAt: now } },
+        { new: true, session }
+      );
+      if (!claimedBet) {
+        const e = new Error('تمت تسوية هذا الرهان مسبقًا'); e.statusCode = 409; throw e;
+      }
+
+      updatedUser = await User.findOneAndUpdate(
+        { telegramId: userId, isBanned: { $ne: true } },
+        { $inc: { gold: wonAmount } },
+        { new: true, session }
+      );
+      if (!updatedUser) {
+        const e = new Error('حسابك غير موجود أو محظور؛ لم تُعتمد تسوية الرهان'); e.statusCode = 403; throw e;
+      }
+    });
 
     const payload = await rocketRoundPayload(round, userId);
     return res.json({
@@ -2195,8 +2243,11 @@ app.post('/api/games/rocket/cashout', rocketAuth, async (req, res) => {
       roundStatus: 'cashed_out', round: payload.round, bets: payload.bets
     });
   } catch (err) {
-    console.error('rocket cashout error:', err);
-    return res.status(500).json({ success: false, message: 'تعذر تنفيذ السحب' });
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, crashed: Boolean(err.crashed), message: err.message });
+    console.error('rocket cashout transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر تنفيذ السحب بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -2257,6 +2308,7 @@ app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
       })),
       tasks: tasks.map((t) => ({
         id: t._id,
+        creatorId: t.creatorId,
         title: t.title,
         current: t.current,
         targetUsers: t.target
@@ -2280,51 +2332,61 @@ app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/process-transaction', adminAuth, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { adminId, txId, action } = req.body;
-
+    // adminAuth already verifies the signed Telegram identity; retain this field check for API compatibility.
     if (String(adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
-
-    if (!['accept', 'reject'].includes(action)) {
-      return res.status(400).json({ success: false, message: 'الإجراء غير صالح' });
+    if (!txId || !['accept', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, message: 'المعاملة أو الإجراء غير صالح' });
     }
 
-    const tx = await Transaction.findOne({ txId });
-    if (!tx) return res.status(404).json({ success: false, message: 'المعاملة غير موجودة' });
-    if (tx.status !== 'pending') {
-      return res.status(409).json({ success: false, message: 'تمت معالجة المعاملة مسبقًا' });
-    }
+    let processedType = '';
+    await session.withTransaction(async () => {
+      const tx = await Transaction.findOne({ txId, status: 'pending' }).session(session);
+      if (!tx) {
+        const existing = await Transaction.findOne({ txId }).select('status').session(session);
+        const e = new Error(existing ? 'تمت معالجة المعاملة مسبقًا' : 'المعاملة غير موجودة');
+        e.statusCode = existing ? 409 : 404;
+        throw e;
+      }
 
-    const updatedTx = await Transaction.findOneAndUpdate(
-      { _id: tx._id, status: 'pending' },
-      { $set: { status: action === 'accept' ? 'approved' : 'rejected' } },
-      { new: true }
-    );
+      if ((action === 'accept' && tx.type === 'إيداع') || (action === 'reject' && tx.type === 'سحب')) {
+        const delta = tx.type === 'إيداع' && action === 'accept' ? tx.amount : tx.amount;
+        const balanceUpdate = await User.updateOne(
+          { telegramId: tx.userId },
+          { $inc: { balance: delta } },
+          { session }
+        );
+        if (!balanceUpdate.matchedCount) {
+          const e = new Error('لم يتم العثور على حساب صاحب المعاملة؛ لم تُعتمد المعاملة');
+          e.statusCode = 404;
+          throw e;
+        }
+      }
 
-    if (!updatedTx) {
-      return res.status(409).json({ success: false, message: 'تمت معالجة المعاملة مسبقًا' });
-    }
-
-    if (action === 'accept' && tx.type === 'إيداع') {
-      await User.updateOne(
-        { telegramId: tx.userId },
-        { $inc: { balance: tx.amount } }
+      const updatedTx = await Transaction.findOneAndUpdate(
+        { _id: tx._id, status: 'pending' },
+        { $set: { status: action === 'accept' ? 'approved' : 'rejected' } },
+        { new: true, session }
       );
-    } else if (action === 'reject' && tx.type === 'سحب') {
-      await User.updateOne(
-        { telegramId: tx.userId },
-        { $inc: { balance: tx.amount } }
-      );
-    }
-
-    res.json({
-      success: true,
-      message: `تم ${action === 'accept' ? 'قبول' : 'رفض'} المعاملة بنجاح`
+      if (!updatedTx) {
+        const e = new Error('تمت معالجة المعاملة مسبقًا');
+        e.statusCode = 409;
+        throw e;
+      }
+      processedType = tx.type;
     });
+
+    return res.json({ success: true, message: `تم ${action === 'accept' ? 'قبول' : 'رفض'} المعاملة بنجاح`, type: processedType });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في معالجة المعاملة' });
+    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
+    console.error('process transaction failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر معالجة المعاملة بأمان. تأكد أن MongoDB يدعم المعاملات (Replica Set).' });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -2430,38 +2492,45 @@ app.post('/api/admin/user-ban', adminAuth, async (req, res) => {
 app.post('/api/admin/modify-balance', adminAuth, async (req, res) => {
   try {
     const { adminId, targetUserId, amount, type, action } = req.body;
-
-    if (String(adminId) !== ADMIN_ID) {
-      return res.status(403).json({ success: false, message: 'غير مصرح' });
-    }
+    if (String(adminId) !== ADMIN_ID) return res.status(403).json({ success: false, message: 'غير مصرح' });
 
     const value = Number(amount);
-    if (!targetUserId || !Number.isFinite(value) || value < 0) {
+    if (!targetUserId || !Number.isFinite(value) || value < 0 || !['add', 'subtract'].includes(action)) {
       return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
     }
 
-    let user = await User.findOne({ telegramId: String(targetUserId) });
-    if (!user) user = new User({ telegramId: String(targetUserId) });
-
     let balanceType = type || 'gold';
     if (balanceType === 'usd') balanceType = 'balance';
-
     if (!['gold', 'diamonds', 'balance'].includes(balanceType)) {
       return res.status(400).json({ success: false, message: 'نوع الرصيد غير صالح' });
     }
-
-    if (action === 'add') {
-      user[balanceType] = (user[balanceType] || 0) + value;
-    } else if (action === 'subtract') {
-      user[balanceType] = Math.max(0, (user[balanceType] || 0) - value);
-    } else {
-      return res.status(400).json({ success: false, message: 'الإجراء غير صالح' });
+    if (['gold', 'diamonds'].includes(balanceType) && !Number.isSafeInteger(value)) {
+      return res.status(400).json({ success: false, message: 'رصيد الذهب والألماس يجب أن يكون عددًا صحيحًا' });
     }
 
-    await user.save();
-    res.json({ success: true, message: 'تم تعديل الرصيد بنجاح', user: publicUser(user) });
+    let user;
+    if (action === 'add') {
+      user = await User.findOneAndUpdate(
+        { telegramId: String(targetUserId) },
+        { $inc: { [balanceType]: value }, $setOnInsert: { name: 'زائر كريم' } },
+        { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true }
+      );
+    } else {
+      user = await User.findOneAndUpdate(
+        { telegramId: String(targetUserId), [balanceType]: { $gte: value } },
+        { $inc: { [balanceType]: -value } },
+        { new: true, runValidators: true }
+      );
+      if (!user) {
+        const existing = await User.findOne({ telegramId: String(targetUserId) }).select('telegramId');
+        return res.status(existing ? 400 : 404).json({ success: false, message: existing ? 'الرصيد لا يكفي للخصم' : 'المستخدم غير موجود' });
+      }
+    }
+
+    return res.json({ success: true, message: 'تم تعديل الرصيد بنجاح', user: publicUser(user) });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في تعديل رصيد المستخدم' });
+    console.error('admin modify balance error:', err);
+    return res.status(500).json({ success: false, message: 'خطأ في تعديل رصيد المستخدم' });
   }
 });
 
