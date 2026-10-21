@@ -126,7 +126,25 @@ const promoSchema = new mongoose.Schema({
   usedBy: [{ type: String }],
   createdAt: { type: Date, default: Date.now }
 });
+// بيانات تمويل الرموز التي ينشئها المستخدمون. الرموز الإدارية القديمة تبقى متوافقة.
+promoSchema.add({
+  creatorId: { type: String, default: null, index: true },
+  fundedAmount: { type: Number, default: 0 },
+  feeAmount: { type: Number, default: 0 },
+  feeRate: { type: Number, default: 0 },
+  fundingStatus: { type: String, enum: ['legacy', 'funded'], default: 'legacy', index: true }
+});
 const Promo = mongoose.model('Promo', promoSchema);
+
+// سجل مستقل لرسوم المنصة المحصلة من إنشاء الرموز الممولة.
+const platformFeeSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  promoCode: { type: String, required: true, unique: true },
+  amount: { type: Number, required: true, min: 0 },
+  rate: { type: Number, required: true, default: 5 },
+  createdAt: { type: Date, default: Date.now }
+});
+const PlatformFee = mongoose.model('PlatformFee', platformFeeSchema);
 
 const transactionSchema = new mongoose.Schema({
   txId: { type: String, required: true },
@@ -1038,14 +1056,36 @@ async function redeemPromo(req, res, responseKey = 'reward') {
       return res.status(400).json({ success: false, message: 'تم استخدام الرمز أو انتهت صلاحيته' });
     }
 
-    user[rewardType] = (user[rewardType] || 0) + reward;
-    await user.save();
+    // زيادة رصيد المستفيد ذريًا بدل حفظ مستند قديم يمكنه الكتابة فوق تحديثات متزامنة.
+    let creditedUser;
+    try {
+      creditedUser = await User.findOneAndUpdate(
+        { telegramId: String(userId), isBanned: { $ne: true } },
+        { $inc: { [rewardType]: reward } },
+        { new: true }
+      );
+    } catch (creditError) {
+      // إذا تعذر إيداع المكافأة، نعيد حجز الرمز قدر الإمكان كي لا يُستهلك بلا مقابل.
+      await Promo.updateOne(
+        { _id: promo._id, usedBy: String(userId) },
+        { $inc: { usedCount: -1 }, $pull: { usedBy: String(userId) } }
+      ).catch((rollbackError) => console.error('promo claim rollback failed:', rollbackError));
+      throw creditError;
+    }
+
+    if (!creditedUser) {
+      await Promo.updateOne(
+        { _id: promo._id, usedBy: String(userId) },
+        { $inc: { usedCount: -1 }, $pull: { usedBy: String(userId) } }
+      );
+      return res.status(403).json({ success: false, message: 'الحساب محظور أو غير موجود' });
+    }
 
     res.json({
       success: true,
       [responseKey]: reward,
       reward,
-      user: publicUser(user),
+      user: publicUser(creditedUser),
       message: `تم تفعيل الكود بنجاح! حصلت على ${reward}`
     });
   } catch (err) {
@@ -1058,33 +1098,106 @@ app.post('/api/promo/redeem', userRequestAuth, (req, res) => redeemPromo(req, re
 app.post('/api/promo/apply', userRequestAuth, (req, res) => redeemPromo(req, res, 'goldReward'));
 
 app.post('/api/promo/create', userRequestAuth, async (req, res) => {
+  let authenticatedUserId = String(req.telegramUser.id);
+  let reservedTotal = 0;
+  let createdPromoId = null;
+  let createdFeeId = null;
+
   try {
-    const { userId, code, maxUses, goldRewardPerPerson } = req.body;
+    const { code, maxUses, goldRewardPerPerson } = req.body || {};
 
-    if (!userId || !code) {
-      return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
+    // لا نقبل القيم الافتراضية الضمنية؛ يجب تحديد عدد المستفيدين ومكافأة كل شخص.
+    const cleanCode = typeof code === 'string' ? code.trim().toUpperCase() : '';
+    const reward = Number(goldRewardPerPerson);
+    const uses = Number(maxUses);
+
+    if (!/^[A-Z0-9_-]{3,32}$/.test(cleanCode)) {
+      return res.status(400).json({ success: false, message: 'الرمز يجب أن يتكون من 3 إلى 32 حرفًا أو رقمًا أو _ أو -' });
+    }
+    if (!Number.isSafeInteger(reward) || reward <= 0 || reward > 1000000000 ||
+        !Number.isSafeInteger(uses) || uses <= 0 || uses > 100000) {
+      return res.status(400).json({ success: false, message: 'قيمة المكافأة أو عدد المستفيدين غير صالح' });
     }
 
-    const user = await User.findOne({ telegramId: String(userId) });
-    if (!user || user.isBanned) {
-      return res.status(403).json({ success: false, message: 'حساب محظور أو غير موجود' });
+    const existing = await Promo.findOne({ code: cleanCode }).select('_id').lean();
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'هذا الرمز موجود مسبقًا' });
     }
 
-    const cleanCode = String(code).trim().toUpperCase();
-    if (await Promo.findOne({ code: cleanCode })) {
-      return res.status(400).json({ success: false, message: 'هذا الكود موجود مسبقاً' });
+    const distributionTotal = reward * uses;
+    const fee = Math.ceil(distributionTotal * 0.05);
+    reservedTotal = distributionTotal + fee;
+    if (!Number.isSafeInteger(distributionTotal) || !Number.isSafeInteger(fee) ||
+        !Number.isSafeInteger(reservedTotal) || reservedTotal <= 0) {
+      return res.status(400).json({ success: false, message: 'المبلغ الإجمالي أكبر من الحد المسموح' });
     }
 
-    await new Promo({
-      code: cleanCode,
-      amount: Number(goldRewardPerPerson || 1000),
-      type: 'gold',
-      maxUses: Number(maxUses || 5)
-    }).save();
+    // خصم ذري مشروط يمنع الرصيد السالب أو إنفاق الرصيد نفسه بطلبات متزامنة.
+    const chargedUser = await User.findOneAndUpdate(
+      { telegramId: authenticatedUserId, isBanned: { $ne: true }, gold: { $gte: reservedTotal } },
+      { $inc: { gold: -reservedTotal } },
+      { new: true }
+    );
+    if (!chargedUser) {
+      const userExists = await User.exists({ telegramId: authenticatedUserId, isBanned: { $ne: true } });
+      return res.status(userExists ? 400 : 403).json({
+        success: false,
+        message: userExists ? `رصيدك غير كافٍ. تحتاج إلى ${reservedTotal} ذهب (يشمل رسوم 5%)` : 'الحساب محظور أو غير موجود'
+      });
+    }
 
-    res.json({ success: true, message: 'تم إنشاء الكود بنجاح' });
+    try {
+      const promo = await new Promo({
+        code: cleanCode,
+        amount: reward,
+        type: 'gold',
+        maxUses: uses,
+        usedCount: 0,
+        usedBy: [],
+        creatorId: authenticatedUserId,
+        fundedAmount: distributionTotal,
+        feeAmount: fee,
+        feeRate: 5,
+        fundingStatus: 'funded'
+      }).save();
+      createdPromoId = promo._id;
+
+      const feeRecord = await new PlatformFee({
+        userId: authenticatedUserId,
+        promoCode: cleanCode,
+        amount: fee,
+        rate: 5
+      }).save();
+      createdFeeId = feeRecord._id;
+
+      return res.json({
+        success: true,
+        message: 'تم إنشاء الرمز وخصم قيمة المكافآت ورسوم المنصة بنجاح',
+        promo: {
+          code: cleanCode,
+          rewardPerPerson: reward,
+          maxUses: uses,
+          distributionTotal,
+          platformFee: fee,
+          feeRate: 5,
+          totalDeducted: reservedTotal
+        },
+        user: publicUser(chargedUser)
+      });
+    } catch (creationError) {
+      // تعويض أي خطوة مكتملة إذا فشلت خطوة لاحقة؛ لا نترك خصمًا بلا رمز.
+      if (createdFeeId) await PlatformFee.deleteOne({ _id: createdFeeId });
+      if (createdPromoId) await Promo.deleteOne({ _id: createdPromoId });
+      await User.updateOne({ telegramId: authenticatedUserId }, { $inc: { gold: reservedTotal } });
+      reservedTotal = 0;
+      if (creationError && creationError.code === 11000) {
+        return res.status(409).json({ success: false, message: 'هذا الرمز موجود مسبقًا' });
+      }
+      throw creationError;
+    }
   } catch (err) {
-    res.status(500).json({ success: false, message: 'فشل إنشاء الرمز' });
+    console.error('promo creation error:', err);
+    return res.status(500).json({ success: false, message: 'فشل إنشاء الرمز؛ إذا خُصم الرصيد فتحقق من سجل الرصيد قبل إعادة المحاولة' });
   }
 });
 
