@@ -2606,6 +2606,102 @@ app.post('/api/admin/delete-promo', adminAuth, async (req, res) => {
   }
 });
 
+
+// --------------------------------------------------
+// رسالة /start الخاصة ببوت Money Slayer
+// تعمل عبر Telegram long polling دون تغيير أي مسار من مسارات Express API.
+// ملاحظة: يجب ألا يكون للبوت webhook أو نسخة polling أخرى تعمل بالتوكن نفسه.
+// --------------------------------------------------
+const START_BOT_TEXT =
+  '👋 **Welcome to Money Slayer.**\n\n' +
+  '📋 Complete simple tasks, play, farm, and withdraw TON and USDT!\n\n' +
+  '🔥 Invite your friends and earn 100% of their earnings!\n\n' +
+  '🚀 Click the button below to get started now';
+
+const START_BOT_KEYBOARD = JSON.stringify({
+  inline_keyboard: [
+    [{ text: 'اضغط هنا للبدأ 💸', web_app: { url: 'https://boisterous-pithivier-f78928.netlify.app/' } }],
+    [{ text: 'اشترك في قناتنا 💎', url: 'https://t.me/moneyslayerchannel' }],
+    [{ text: 'انضم لمجموعتنا 💡', url: 'https://t.me/moneyslayergroup' }]
+  ]
+});
+
+let telegramUpdateOffset = 0;
+let telegramPollingStarted = false;
+
+function telegramLongPollGetUpdates(offset) {
+  return new Promise((resolve, reject) => {
+    if (!TELEGRAM_BOT_TOKEN) return reject(new Error('TELEGRAM_BOT_TOKEN غير مضبوط'));
+    const query = new URLSearchParams({
+      offset: String(offset),
+      timeout: '25',
+      allowed_updates: JSON.stringify(['message'])
+    }).toString();
+    const req = https.get({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/getUpdates?${query}`,
+      headers: { Accept: 'application/json' }
+    }, (res) => {
+      let raw = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        raw += chunk;
+        if (raw.length > 1000000) req.destroy(new Error('Telegram response too large'));
+      });
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          if (!data.ok) return reject(new Error(data.description || 'getUpdates failed'));
+          resolve(data.result || []);
+        } catch {
+          reject(new Error('Invalid JSON from Telegram getUpdates'));
+        }
+      });
+    });
+    req.setTimeout(35000, () => req.destroy(new Error('Telegram long poll timeout')));
+    req.on('error', (err) => reject(new Error(`Telegram polling failed: ${err.code || err.message}`)));
+  });
+}
+
+async function handleTelegramStartUpdate(update) {
+  const message = update && update.message;
+  const text = message && typeof message.text === 'string' ? message.text.trim() : '';
+  if (!message || !message.chat || !/^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return;
+
+  const result = await telegramBotApi('sendMessage', {
+    chat_id: String(message.chat.id),
+    text: START_BOT_TEXT,
+    parse_mode: 'Markdown',
+    reply_markup: START_BOT_KEYBOARD,
+    disable_web_page_preview: 'true'
+  });
+  if (!result || !result.ok) {
+    throw new Error((result && result.description) || 'Telegram sendMessage failed');
+  }
+}
+
+async function startTelegramStartPolling() {
+  if (telegramPollingStarted || !TELEGRAM_BOT_TOKEN) return;
+  telegramPollingStarted = true;
+  console.log('🤖 تم تفعيل معالج /start لبوت Telegram عبر long polling');
+  while (true) {
+    try {
+      const updates = await telegramLongPollGetUpdates(telegramUpdateOffset);
+      for (const update of updates) {
+        telegramUpdateOffset = Math.max(telegramUpdateOffset, Number(update.update_id) + 1);
+        try {
+          await handleTelegramStartUpdate(update);
+        } catch (err) {
+          console.error('Telegram /start handler error:', err.message);
+        }
+      }
+    } catch (err) {
+      console.error('Telegram polling error:', err.message);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
+}
+
 // --------------------------------------------------
 // تشغيل السيرفر
 // --------------------------------------------------
@@ -2614,6 +2710,7 @@ const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`🚀 السيرفر يعمل على المنفذ ${PORT}`);
+  startTelegramStartPolling();
 
   if (!TELEGRAM_BOT_TOKEN) {
     console.warn('⚠️ TELEGRAM_BOT_TOKEN غير مضبوط في Railway؛ ستُرفض طلبات الصاروخ بـ 401 حتى تضيف رمز البوت الصحيح من BotFather.');
