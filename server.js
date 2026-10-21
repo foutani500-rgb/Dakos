@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const crypto = require('crypto');
+const https = require('https');
 require('dotenv').config();
 
 const app = express();
@@ -55,6 +56,15 @@ const REFERRAL_REWARD_GOLD = 1000;
 // الصديق يُعد "نشطًا" إذا فتح التطبيق خلال آخر 7 أيام.
 const FRIEND_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
+// مكافأة المهام: 1000 Gold لكل مهمة، لكن فقط بعد التحقق الفعلي من الانضمام عبر Telegram Bot API.
+const TASK_REWARD_GOLD = 1000;
+// سقف يومي (بتوقيت UTC) لعدد المهام التي يُكافأ عليها المستخدم؛ الافتراضي 100 وقابل للضبط عبر DAILY_TASK_REWARD_LIMIT.
+const DAILY_TASK_REWARD_LIMIT = Math.max(1, Number.parseInt(process.env.DAILY_TASK_REWARD_LIMIT, 10) || 100);
+// للمهام التي لا يمكن التحقق منها عبر تلغرام: أقل مدة بين فتح الرابط وطلب المكافأة (ضع 0 لإلغائها).
+const UNVERIFIABLE_TASK_MIN_WAIT_MS = 10 * 1000;
+// أقل فاصل بين محاولتي تحقق لنفس المستخدم لحماية حصة Bot API من الإغراق.
+const TASK_VERIFY_COOLDOWN_MS = 3000;
+
 // إعدادات الصاروخ
 // هامش نظري مستهدف للعبة: 5% على المدى الطويل وفق نموذج الاحتمالات أدناه؛
 // ليس ضمانًا لربح المنصة في كل جولة أو فترة قصيرة.
@@ -76,7 +86,13 @@ const userSchema = new mongoose.Schema({
   name: { type: String, default: 'زائر كريم' },
   // كل حساب جديد يبدأ برصيد صفر؛ لا توجد هدايا ابتدائية.
   gold: { type: Number, default: 0 },
+  // diamonds هو رصيد عملة GRAM في المحفظة.
   diamonds: { type: Number, default: 0 },
+  // أرصدة العملات الأخرى الناتجة عن التحويل من المحفظة.
+  trx: { type: Number, default: 0 },
+  btc: { type: Number, default: 0 },
+  eth: { type: Number, default: 0 },
+  sol: { type: Number, default: 0 },
   balance: { type: Number, default: 0 },
   currency: { type: String, default: 'MAD' },
   referralCount: { type: Number, default: 0 },
@@ -115,6 +131,16 @@ const taskVisitTicketSchema = new mongoose.Schema({
   usedAt: { type: Date, default: null }
 }, { timestamps: true });
 const TaskVisitTicket = mongoose.model('TaskVisitTicket', taskVisitTicketSchema);
+
+// عداد يومي لمكافآت المهام لكل مستخدم (يُحذف تلقائيًا بعد يومين).
+const taskDailyCounterSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  day: { type: String, required: true }, // YYYY-MM-DD بتوقيت UTC
+  count: { type: Number, default: 0 },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } }
+});
+taskDailyCounterSchema.index({ userId: 1, day: 1 }, { unique: true });
+const TaskDailyCounter = mongoose.model('TaskDailyCounter', taskDailyCounterSchema);
 
 
 const promoSchema = new mongoose.Schema({
@@ -224,6 +250,10 @@ function publicUser(user) {
     name: user.name,
     gold: user.gold,
     diamonds: user.diamonds,
+    trx: user.trx || 0,
+    btc: user.btc || 0,
+    eth: user.eth || 0,
+    sol: user.sol || 0,
     balance: user.balance,
     currency: user.currency,
     referralCount: user.referralCount,
@@ -705,6 +735,413 @@ app.post('/api/friends/claim', telegramAuth, async (req, res) => {
 // 3. المحفظة والتحويلات
 // --------------------------------------------------
 
+// ---------- أسعار العملات والتحويل بينها ----------
+
+// سعر الذهب ثابت: كل 100,000 ذهب = 5$ (أي 20,000 ذهب = 1$).
+const GOLD_PER_USD = 20000;
+// الحد الأدنى لقيمة أي عملية تحويل بالدولار (200 ذهب = 0.01$).
+const MIN_CONVERT_USD = 0.01;
+// رسوم التحويل بين العملات (0 = بدون رسوم، 0.01 = 1%). يمكن ضبطها من WALLET_CONVERT_FEE_RATE.
+const WALLET_CONVERT_FEE_RATE = Math.min(
+  0.5,
+  Math.max(0, Number(process.env.WALLET_CONVERT_FEE_RATE) || 0)
+);
+
+const PRICE_CACHE_TTL_MS = 30 * 1000;          // أقصى عمر للسعر قبل تحديثه عند الطلب
+const PRICE_REFRESH_INTERVAL_MS = 30 * 1000;   // تحديث دوري في الخلفية
+const PRICE_MAX_STALE_MS = 5 * 60 * 1000;      // بعد هذه المدة يُرفض التحويل بدل استخدام سعر قديم
+const PRICE_FETCH_TIMEOUT_MS = 6000;
+const PRICE_MAX_SOURCE_DIVERGENCE = 0.03;      // أقصى فرق مسموح بين مصدرين (3%)
+
+// العملة -> الحقل الذي يخزن رصيدها في قاعدة البيانات.
+// GRAM هو الرصيد المخزن في diamonds، و USDT هو الرصيد المالي balance.
+const CONVERTIBLE_ASSETS = {
+  GOLD: 'gold',
+  USDT: 'balance',
+  GRAM: 'diamonds',
+  TRX: 'trx',
+  BTC: 'btc',
+  ETH: 'eth',
+  SOL: 'sol'
+};
+
+// العملات التي لها سعر سوق حي (GRAM = Toncoin سابقًا).
+const MARKET_ASSETS = ['BTC', 'ETH', 'SOL', 'TRX', 'GRAM'];
+
+const COINGECKO_IDS = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  SOL: 'solana',
+  TRX: 'tron',
+  GRAM: process.env.GRAM_COINGECKO_ID || 'the-open-network'
+};
+
+const BINANCE_SYMBOLS = {
+  BTC: ['BTCUSDT'],
+  ETH: ['ETHUSDT'],
+  SOL: ['SOLUSDT'],
+  TRX: ['TRXUSDT'],
+  GRAM: ['GRAMUSDT', 'TONUSDT']
+};
+
+const ASSET_ALIASES = {
+  GOLD: 'GOLD', G: 'GOLD',
+  USDT: 'USDT', USD: 'USDT', BALANCE: 'USDT', DOLLAR: 'USDT', '$': 'USDT',
+  GRAM: 'GRAM', DIAMOND: 'GRAM', DIAMONDS: 'GRAM', '💎': 'GRAM', TON: 'GRAM', TONCOIN: 'GRAM',
+  TRX: 'TRX', TRON: 'TRX',
+  BTC: 'BTC', BITCOIN: 'BTC',
+  ETH: 'ETH', ETHEREUM: 'ETH',
+  SOL: 'SOL', SOLANA: 'SOL'
+};
+
+function normalizeAssetSymbol(value) {
+  if (value === undefined || value === null) return null;
+  const key = String(value).trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(ASSET_ALIASES, key) ? ASSET_ALIASES[key] : null;
+}
+
+// تقريب لأقرب 8 خانات عشرية (لمبلغ يخصمه المستخدم).
+function roundTo8(value) {
+  return Number(Number(value).toFixed(8));
+}
+
+// تقريب لأسفل إلى 8 خانات عشرية (لمبلغ يستلمه المستخدم، لصالح المنصة دائمًا).
+function floorTo8(value) {
+  return Math.floor(Number((Number(value) * 1e8).toFixed(3))) / 1e8;
+}
+
+function httpsGetJson(url, { headers = {}, timeoutMs = PRICE_FETCH_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      url,
+      { headers: { Accept: 'application/json', 'User-Agent': 'moneyslayer-server/1.0', ...headers } },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          raw += chunk;
+          if (raw.length > 1000000) req.destroy(new Error('response too large'));
+        });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`HTTP ${res.statusCode}`));
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (err) {
+            reject(new Error('invalid JSON'));
+          }
+        });
+      }
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function fetchCoinGeckoPrices() {
+  const idToSymbol = {};
+  Object.entries(COINGECKO_IDS).forEach(([symbol, id]) => {
+    idToSymbol[id] = symbol;
+  });
+
+  const headers = process.env.COINGECKO_API_KEY
+    ? { 'x-cg-demo-api-key': process.env.COINGECKO_API_KEY }
+    : {};
+
+  const ids = Object.keys(idToSymbol).join(',');
+  const data = await httpsGetJson(
+    `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids)}&vs_currencies=usd`,
+    { headers }
+  );
+
+  const out = {};
+  for (const [id, symbol] of Object.entries(idToSymbol)) {
+    const price = Number(data && data[id] && data[id].usd);
+    if (Number.isFinite(price) && price > 0) out[symbol] = price;
+  }
+  return out;
+}
+
+async function fetchBinancePrices() {
+  const out = {};
+
+  await Promise.all(
+    Object.entries(BINANCE_SYMBOLS).map(async ([symbol, pairs]) => {
+      for (const pair of pairs) {
+        try {
+          const data = await httpsGetJson(
+            `https://data-api.binance.vision/api/v3/ticker/price?symbol=${pair}`
+          );
+          const price = Number(data && data.price);
+          if (Number.isFinite(price) && price > 0) {
+            out[symbol] = price;
+            return;
+          }
+        } catch (err) {
+          // نجرب الرمز التالي.
+        }
+      }
+    })
+  );
+
+  return out;
+}
+
+const marketPrices = { prices: {}, times: {} };
+let priceRefreshPromise = null;
+
+// يجلب الأسعار من CoinGecko و Binance. إذا توفر المصدران ويتقاربان نأخذ متوسطهما،
+// وإذا تباعدا أكثر من 3% نتجاهل التحديث لتلك العملة (حماية من سعر خاطئ).
+function refreshMarketPrices() {
+  if (priceRefreshPromise) return priceRefreshPromise;
+
+  priceRefreshPromise = (async () => {
+    const [cg, bn] = await Promise.allSettled([fetchCoinGeckoPrices(), fetchBinancePrices()]);
+
+    if (cg.status === 'rejected') console.warn('CoinGecko price fetch failed:', cg.reason && cg.reason.message);
+    if (bn.status === 'rejected') console.warn('Binance price fetch failed:', bn.reason && bn.reason.message);
+
+    const cgPrices = cg.status === 'fulfilled' ? cg.value : {};
+    const bnPrices = bn.status === 'fulfilled' ? bn.value : {};
+
+    for (const symbol of MARKET_ASSETS) {
+      const a = cgPrices[symbol];
+      const b = bnPrices[symbol];
+      let price = null;
+
+      if (a && b) {
+        const divergence = Math.abs(a - b) / Math.min(a, b);
+        if (divergence > PRICE_MAX_SOURCE_DIVERGENCE) {
+          console.error(`Price sources diverge for ${symbol}: coingecko=${a} binance=${b}`);
+          continue;
+        }
+        price = (a + b) / 2;
+      } else {
+        price = a || b || null;
+      }
+
+      if (price) {
+        marketPrices.prices[symbol] = price;
+        marketPrices.times[symbol] = Date.now();
+      }
+    }
+  })()
+    .catch((err) => {
+      console.error('Price refresh error:', err && err.message);
+    })
+    .finally(() => {
+      priceRefreshPromise = null;
+    });
+
+  return priceRefreshPromise;
+}
+
+// تسخين الأسعار عند التشغيل وتحديثها دوريًا.
+refreshMarketPrices();
+setInterval(refreshMarketPrices, PRICE_REFRESH_INTERVAL_MS).unref();
+
+// يعيد سعر العملة بالدولار، أو null إذا لم يتوفر سعر حديث.
+async function getAssetUsdPrice(symbol) {
+  if (symbol === 'USDT') return 1;
+  if (symbol === 'GOLD') return 1 / GOLD_PER_USD;
+
+  const updatedAt = marketPrices.times[symbol] || 0;
+  if (Date.now() - updatedAt > PRICE_CACHE_TTL_MS) {
+    await refreshMarketPrices();
+  }
+
+  const price = marketPrices.prices[symbol];
+  const lastUpdate = marketPrices.times[symbol] || 0;
+  if (!price || Date.now() - lastUpdate > PRICE_MAX_STALE_MS) return null;
+  return price;
+}
+
+async function getWalletPriceSnapshot() {
+  const entries = await Promise.all(
+    MARKET_ASSETS.map(async (symbol) => [symbol, await getAssetUsdPrice(symbol)])
+  );
+
+  const prices = { USDT: 1 };
+  entries.forEach(([symbol, price]) => {
+    prices[symbol] = price;
+  });
+
+  const times = MARKET_ASSETS.map((symbol) => marketPrices.times[symbol] || 0).filter(Boolean);
+
+  return {
+    prices,
+    updatedAt: times.length ? new Date(Math.min(...times)).toISOString() : null,
+    complete: MARKET_ASSETS.every((symbol) => prices[symbol] !== null)
+  };
+}
+
+// القيمة بالدولار: الذهب بالقسمة على 20,000 (دقيقة)، و USDT كما هي، والباقي بالسعر الحي.
+function usdValueOf(symbol, amount, price) {
+  if (symbol === 'GOLD') return amount / GOLD_PER_USD;
+  if (symbol === 'USDT') return amount;
+  return amount * price;
+}
+
+async function performWalletConversion(userId, fromRaw, toRaw, amountRaw) {
+  const from = normalizeAssetSymbol(fromRaw);
+  const to = normalizeAssetSymbol(toRaw);
+
+  if (!from || !to) {
+    return { status: 400, body: { success: false, message: 'العملة غير مدعومة.' } };
+  }
+
+  if (from === to) {
+    return { status: 400, body: { success: false, message: 'اختر عملتين مختلفتين.' } };
+  }
+
+  if (to === 'GOLD') {
+    return { status: 400, body: { success: false, message: 'لا يمكن التحويل إلى الذهب.' } };
+  }
+
+  if (!isValidPositiveNumber(amountRaw)) {
+    return { status: 400, body: { success: false, message: 'المبلغ غير صالح.' } };
+  }
+
+  let amount = Number(amountRaw);
+
+  if (from === 'GOLD') {
+    if (!Number.isSafeInteger(amount)) {
+      return { status: 400, body: { success: false, message: 'كمية الذهب يجب أن تكون عددًا صحيحًا.' } };
+    }
+  } else {
+    amount = roundTo8(amount);
+    if (!(amount > 0)) {
+      return { status: 400, body: { success: false, message: 'المبلغ صغير جدًا.' } };
+    }
+  }
+
+  const [fromPrice, toPrice] = await Promise.all([getAssetUsdPrice(from), getAssetUsdPrice(to)]);
+
+  if (!fromPrice || !toPrice) {
+    return {
+      status: 503,
+      body: { success: false, message: 'أسعار السوق غير متاحة حاليًا. حاول بعد لحظات.' }
+    };
+  }
+
+  const usdValue = usdValueOf(from, amount, fromPrice);
+
+  if (!Number.isFinite(usdValue) || usdValue < MIN_CONVERT_USD) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        message: `الحد الأدنى للتحويل ما يعادل ${MIN_CONVERT_USD}$ (${GOLD_PER_USD * MIN_CONVERT_USD} ذهب).`
+      }
+    };
+  }
+
+  const netUsd = usdValue * (1 - WALLET_CONVERT_FEE_RATE);
+  const received = to === 'USDT' ? floorTo8(netUsd) : floorTo8(netUsd / toPrice);
+
+  if (!Number.isFinite(received) || !(received > 0)) {
+    return { status: 400, body: { success: false, message: 'المبلغ صغير جدًا للتحويل.' } };
+  }
+
+  const fromField = CONVERTIBLE_ASSETS[from];
+  const toField = CONVERTIBLE_ASSETS[to];
+  const telegramId = String(userId);
+
+  // خصم وإضافة في عملية واحدة ذرية؛ تفشل إذا الرصيد غير كافٍ.
+  const updatedUser = await User.findOneAndUpdate(
+    { telegramId, isBanned: { $ne: true }, [fromField]: { $gte: amount } },
+    { $inc: { [fromField]: -amount, [toField]: received } },
+    { new: true }
+  );
+
+  if (!updatedUser) {
+    const existing = await User.findOne({ telegramId });
+    if (!existing) {
+      return { status: 404, body: { success: false, message: 'المستخدم غير موجود.' } };
+    }
+    if (existing.isBanned) {
+      return { status: 403, body: { success: false, message: 'هذا الحساب محظور.' } };
+    }
+    return { status: 400, body: { success: false, message: `رصيد ${from} غير كافٍ.` } };
+  }
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: `تم تحويل ${amount} ${from} إلى ${received} ${to}.`,
+      from,
+      to,
+      amount,
+      received,
+      usdValue,
+      feeRate: WALLET_CONVERT_FEE_RATE,
+      rates: {
+        goldPerUsd: GOLD_PER_USD,
+        fromUsd: usdValue / amount,
+        toUsd: toPrice
+      },
+      user: publicUser(updatedUser)
+    }
+  };
+}
+
+// أنواع التحويل القديمة التي قد ترسلها الواجهة (تبقى مدعومة).
+// ملاحظة: diamonds_to_gram يحوّل رصيد GRAM (diamonds) إلى الرصيد المالي USDT.
+const LEGACY_EXCHANGE_TYPES = {
+  gold_to_diamonds: ['GOLD', 'GRAM'],
+  diamonds_to_gram: ['GRAM', 'USDT']
+};
+
+async function walletConversionHandler(req, res) {
+  try {
+    const body = req.body || {};
+    const userId = String(body.userId);
+
+    let from = body.from ?? body.fromSymbol ?? body.fromCurrency ?? body.fromAsset;
+    let to = body.to ?? body.toSymbol ?? body.toCurrency ?? body.toAsset;
+    const type = typeof body.type === 'string' ? body.type.trim().toLowerCase() : '';
+
+    if ((from === undefined || to === undefined) && type) {
+      if (LEGACY_EXCHANGE_TYPES[type]) {
+        [from, to] = LEGACY_EXCHANGE_TYPES[type];
+      } else if (type.includes('_to_')) {
+        const [typeFrom, typeTo] = type.split('_to_');
+        from = typeFrom;
+        to = typeTo;
+      }
+    }
+
+    if (from === undefined || to === undefined) {
+      return res.status(400).json({ success: false, message: 'نوع التحويل غير صالح.' });
+    }
+
+    const result = await performWalletConversion(userId, from, to, body.amount);
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    console.error('Wallet conversion error:', err);
+    return res.status(500).json({ success: false, message: 'حدث خطأ أثناء التحويل.' });
+  }
+}
+
+app.get('/api/wallet/prices', telegramAuth, async (req, res) => {
+  try {
+    const snapshot = await getWalletPriceSnapshot();
+    res.json({
+      success: true,
+      goldPerUsd: GOLD_PER_USD,
+      usdPer100kGold: (100000 / GOLD_PER_USD),
+      prices: snapshot.prices,
+      updatedAt: snapshot.updatedAt,
+      complete: snapshot.complete
+    });
+  } catch (err) {
+    console.error('Wallet prices error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب الأسعار.' });
+  }
+});
+
 app.get('/api/wallet/details', userRequestAuth, async (req, res) => {
   try {
     const { userId } = req.query;
@@ -717,18 +1154,27 @@ app.get('/api/wallet/details', userRequestAuth, async (req, res) => {
     }
 
     const transactions = await Transaction.find({ userId: String(userId) }).sort({ createdAt: -1 });
+    const snapshot = await getWalletPriceSnapshot();
+
+    // السعر الحي بالدولار؛ 0 مع priceAvailable=false إذا لم يتوفر سعر حديث.
+    const priceOf = (symbol) => snapshot.prices[symbol] ?? 0;
+    const hasPrice = (symbol) => snapshot.prices[symbol] !== null && snapshot.prices[symbol] !== undefined;
 
     res.json({
       success: true,
       balance: user ? user.balance : 0,
       gold: user ? user.gold : 0,
+      diamonds: user ? user.diamonds : 0,
+      goldPerUsd: GOLD_PER_USD,
+      usdPer100kGold: 100000 / GOLD_PER_USD,
+      pricesUpdatedAt: snapshot.updatedAt,
       assets: [
-        { symbol: 'USDT', name: 'TetherUS', logo: '₮', color: '#26a69a', amount: user ? user.balance : 0, rate: 1 },
-        { symbol: 'GRAM', name: 'Gram Token', logo: '💎', color: '#00d2ff', amount: user ? user.diamonds : 0, rate: 1.2 },
-        { symbol: 'TRX', name: 'Tron', logo: 'TRX', color: '#ff0000', amount: 0, rate: 0.12 },
-        { symbol: 'BTC', name: 'Bitcoin', logo: '₿', color: '#f7931a', amount: 0, rate: 68000 },
-        { symbol: 'ETH', name: 'Ethereum', logo: 'Ξ', color: '#627eea', amount: 0, rate: 3400 },
-        { symbol: 'SOL', name: 'Solana', logo: '◎', color: '#14f195', amount: 0, rate: 145 }
+        { symbol: 'USDT', name: 'TetherUS', logo: '₮', color: '#26a69a', amount: user ? user.balance : 0, rate: 1, priceAvailable: true },
+        { symbol: 'GRAM', name: 'Gram Token', logo: '💎', color: '#00d2ff', amount: user ? user.diamonds : 0, rate: priceOf('GRAM'), priceAvailable: hasPrice('GRAM') },
+        { symbol: 'TRX', name: 'Tron', logo: 'TRX', color: '#ff0000', amount: user ? user.trx || 0 : 0, rate: priceOf('TRX'), priceAvailable: hasPrice('TRX') },
+        { symbol: 'BTC', name: 'Bitcoin', logo: '₿', color: '#f7931a', amount: user ? user.btc || 0 : 0, rate: priceOf('BTC'), priceAvailable: hasPrice('BTC') },
+        { symbol: 'ETH', name: 'Ethereum', logo: 'Ξ', color: '#627eea', amount: user ? user.eth || 0 : 0, rate: priceOf('ETH'), priceAvailable: hasPrice('ETH') },
+        { symbol: 'SOL', name: 'Solana', logo: '◎', color: '#14f195', amount: user ? user.sol || 0 : 0, rate: priceOf('SOL'), priceAvailable: hasPrice('SOL') }
       ],
       transactions: transactions.map((t) => ({
         id: t.txId,
@@ -746,70 +1192,9 @@ app.get('/api/wallet/details', userRequestAuth, async (req, res) => {
   }
 });
 
-app.post('/api/wallet/exchange', userRequestAuth, async (req, res) => {
-  try {
-    const { userId, type, amount } = req.body;
-
-    if (!userId || !isValidPositiveNumber(amount)) {
-      return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
-    }
-
-    const val = Number(amount);
-    let user = null;
-
-    if (type === 'diamonds_to_gram') {
-      user = await User.findOneAndUpdate(
-        { telegramId: String(userId), isBanned: { $ne: true }, diamonds: { $gte: val } },
-        { $inc: { diamonds: -val, balance: val / 500 } },
-        { new: true, runValidators: true }
-      );
-    } else if (type === 'gold_to_diamonds') {
-      if (val < 200) {
-        return res.status(400).json({ success: false, message: 'الحد الأدنى لتحويل الذهب إلى ألماس هو 200 ذهب' });
-      }
-      user = await User.findOneAndUpdate(
-        { telegramId: String(userId), isBanned: { $ne: true }, gold: { $gte: val } },
-        { $inc: { gold: -val, diamonds: Math.floor(val / 200) } },
-        { new: true, runValidators: true }
-      );
-    } else {
-      return res.status(400).json({ success: false, message: 'نوع التحويل غير صالح' });
-    }
-
-    if (!user) {
-      const exists = await User.findOne({ telegramId: String(userId) }).select('isBanned');
-      if (!exists) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-      if (exists.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
-      return res.status(400).json({ success: false, message: 'الرصيد غير كافٍ' });
-    }
-
-    res.json({ success: true, message: 'تم التحويل بنجاح', user: publicUser(user) });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في التحويل' });
-  }
-});
-
-app.post('/api/wallet/convert', userRequestAuth, async (req, res) => {
-  try {
-    const { userId, amount } = req.body;
-
-    if (!userId || !isValidPositiveNumber(amount)) {
-      return res.status(400).json({ success: false, message: 'بيانات غير صالحة' });
-    }
-
-    const user = await User.findOne({ telegramId: String(userId) });
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    if (user.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
-
-    // لا توجد أسعار/دفاتر أرصدة موثوقة لكل الأصول في قاعدة البيانات؛ لا نُعلن نجاحًا وهميًا.
-    return res.status(501).json({
-      success: false,
-      message: 'التحويل بين هذه العملات غير متاح حاليًا؛ لم يتم خصم أو إضافة أي رصيد.'
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ في التحويل الفوري' });
-  }
-});
+// التحويل بين العملات (المسار القديم والجديد يستخدمان نفس المنطق).
+app.post('/api/wallet/exchange', userRequestAuth, walletConversionHandler);
+app.post('/api/wallet/convert', userRequestAuth, walletConversionHandler);
 
 const handleTransfer = async (req, res) => {
   try {
@@ -1205,6 +1590,89 @@ app.post('/api/promo/create', userRequestAuth, async (req, res) => {
 // 5. المهام
 // --------------------------------------------------
 
+// --------------------------------------------------
+// التحقق الفعلي من الانضمام عبر Telegram Bot API (getChatMember)
+// --------------------------------------------------
+
+const TELEGRAM_RESERVED_PATHS = new Set([
+  'joinchat', 'addstickers', 'addemoji', 'addtheme', 'addlist', 'setlanguage', 'share',
+  'proxy', 'socks', 'login', 'invoice', 'boost', 'iv', 'giftcode', 'contact', 'bg',
+  'confirmphone', 'message', 'web'
+]);
+
+// يستخرج اسم القناة/المجموعة العامة من رابط t.me. الروابط الخاصة (+invite / joinchat / c/)
+// لا يمكن التحقق منها عبر getChatMember فتُرفض.
+function extractTelegramChat(link) {
+  let url;
+  try { url = link instanceof URL ? link : new URL(String(link)); } catch { return null; }
+  if (!['http:', 'https:'].includes(url.protocol)) return null;
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  if (!['t.me', 'telegram.me', 'telegram.dog'].includes(host)) return null;
+  const first = url.pathname.split('/').filter(Boolean)[0];
+  if (!first || !/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(first)) return null;
+  if (TELEGRAM_RESERVED_PATHS.has(first.toLowerCase())) return null;
+  return { username: first, chatId: `@${first}`, link: `https://t.me/${first}` };
+}
+
+// استدعاء Bot API؛ يُرجع JSON الخام (ok / result / description) حتى في حالة أخطاء 4xx.
+function telegramBotApi(method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!TELEGRAM_BOT_TOKEN) return reject(new Error('TELEGRAM_BOT_TOKEN غير مضبوط'));
+    const query = new URLSearchParams(params).toString();
+    const req = https.get(
+      { hostname: 'api.telegram.org', path: `/bot${TELEGRAM_BOT_TOKEN}/${method}?${query}`, headers: { Accept: 'application/json' } },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          raw += chunk;
+          if (raw.length > 200000) req.destroy(new Error('response too large'));
+        });
+        res.on('end', () => {
+          try { resolve(JSON.parse(raw)); } catch { reject(new Error('invalid JSON from Telegram')); }
+        });
+      }
+    );
+    req.setTimeout(8000, () => req.destroy(new Error('timeout')));
+    // لا نمرر رسالة الخطأ الأصلية كما هي حتى لا يتسرب مسار الطلب (يحتوي رمز البوت) إلى السجلات.
+    req.on('error', (err) => reject(new Error(`Telegram request failed: ${err.code || err.message}`)));
+  });
+}
+
+// يرجع { isMember } أو يرمي خطأ (unverifiable) إذا تعذر التحقق (البوت ليس مشرفًا، القناة محذوفة، حد الطلبات...).
+async function checkTelegramMembership(chatId, telegramUserId) {
+  const data = await telegramBotApi('getChatMember', { chat_id: chatId, user_id: String(telegramUserId) });
+  if (data && data.ok && data.result) {
+    const status = data.result.status;
+    const isMember = ['creator', 'administrator', 'member'].includes(status) ||
+      (status === 'restricted' && data.result.is_member === true);
+    return { isMember };
+  }
+  const description = String((data && data.description) || '').toLowerCase();
+  if (description.includes('user not found') || description.includes('participant_id_invalid')) {
+    return { isMember: false };
+  }
+  const err = new Error(`getChatMember failed: ${(data && data.error_code) || '?'} ${description}`);
+  err.unverifiable = true;
+  throw err;
+}
+
+// عند إنشاء المهمة: نتأكد أن الرابط قناة/مجموعة عامة وأن البوت يستطيع قراءة أعضائها.
+async function assertBotCanVerifyChat(chat, probeUserId) {
+  const info = await telegramBotApi('getChat', { chat_id: chat.chatId });
+  if (!info || !info.ok || !info.result || !['channel', 'supergroup', 'group'].includes(info.result.type)) {
+    return { ok: false, message: 'الرابط لا يشير إلى قناة أو مجموعة تلغرام عامة موجودة.' };
+  }
+  try {
+    await checkTelegramMembership(chat.chatId, probeUserId);
+  } catch {
+    return { ok: false, message: 'أضف البوت كمشرف (Admin) في القناة أو المجموعة أولاً ليتمكن من التحقق من المنضمين، ثم أعد إنشاء المهمة.' };
+  }
+  return { ok: true };
+}
+
+const taskVerifyCooldown = new Map();
+
 app.get('/api/tasks', async (req, res) => {
   try {
     const tasks = await Task.find({ status: { $ne: 'مكتملة' } }).sort({ createdAt: -1 });
@@ -1228,7 +1696,8 @@ app.get('/api/tasks/list', userRequestAuth, async (req, res) => {
         link: t.link,
         targetUsers: t.target,
         current: t.current,
-        rewardGold: 1000,
+        rewardGold: TASK_REWARD_GOLD,
+        verifiable: !!extractTelegramChat(t.link),
         completedBy: t.completedBy
       }))
     });
@@ -1253,6 +1722,18 @@ async function createPaidTask(req, res, legacyRoute = false) {
   if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
     return res.status(400).json({ success: false, message: 'يسمح بروابط HTTP وHTTPS فقط' });
   }
+  // مهام قنوات/مجموعات تلغرام العامة يُتحقق منها فعليًا بـ getChatMember، لذا يجب أن يكون البوت مشرفًا فيها.
+  // باقي الروابط (يوتيوب، إنستغرام، روابط دعوة خاصة...) تُقبل كما هي.
+  const chat = extractTelegramChat(parsedUrl);
+  if (chat) {
+    try {
+      const botCheck = await assertBotCanVerifyChat(chat, userId);
+      if (!botCheck.ok) return res.status(400).json({ success: false, message: botCheck.message });
+    } catch (err) {
+      console.error('Task chat verification setup failed:', err.message);
+      return res.status(503).json({ success: false, message: 'تعذر الاتصال بتلغرام للتحقق من القناة، حاول لاحقًا.' });
+    }
+  }
   const totalCost = target / 50; // $1 per 50 users; 10,000 users costs $200.
   const session = await mongoose.startSession();
   let createdTask;
@@ -1272,7 +1753,7 @@ async function createPaidTask(req, res, legacyRoute = false) {
       const docs = await Task.create([{
         title: title.trim().slice(0, 160),
         platform: String(platform || 'Telegram').slice(0, 40),
-        link: parsedUrl.href, target, cost: totalCost.toFixed(2), creatorId: userId
+        link: chat ? chat.link : parsedUrl.href, target, cost: totalCost.toFixed(2), creatorId: userId
       }], { session });
       createdTask = docs[0];
     });
@@ -1344,17 +1825,98 @@ app.post('/api/tasks/complete', userRequestAuth, async (req, res) => {
     return res.status(400).json({ success: false, message: 'يجب فتح رابط المهمة من زر الزيارة أولاً.' });
   }
   const tokenHash = crypto.createHash('sha256').update(visitToken).digest('hex');
+
+  // تهدئة بين محاولات التحقق لنفس المستخدم.
+  const now = Date.now();
+  if (now - (taskVerifyCooldown.get(userId) || 0) < TASK_VERIFY_COOLDOWN_MS) {
+    return res.status(429).json({ success: false, message: 'انتظر بضع ثوانٍ ثم حاول التحقق مجددًا.' });
+  }
+  taskVerifyCooldown.set(userId, now);
+  if (taskVerifyCooldown.size > 5000) {
+    for (const [key, ts] of taskVerifyCooldown) {
+      if (now - ts > TASK_VERIFY_COOLDOWN_MS) taskVerifyCooldown.delete(key);
+    }
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  try {
+    // فحوص قراءة فقط قبل أي اتصال خارجي.
+    const task = await Task.findOne({ _id: taskId, status: { $ne: 'مكتملة' } }).lean();
+    if (!task) return res.status(404).json({ success: false, message: 'المهمة غير موجودة أو مكتملة' });
+    if (String(task.creatorId) === userId) return res.status(403).json({ success: false, message: 'لا يمكنك إكمال مهمتك الخاصة' });
+    if ((task.completedBy || []).map(String).includes(userId)) return res.status(400).json({ success: false, message: 'لقد أتممت هذه المهمة مسبقًا' });
+
+    const chat = extractTelegramChat(task.link); // null = مهمة غير تلغرامية عامة (لا يمكن التحقق عبر Bot API)
+
+    const visitedTicket = await TaskVisitTicket.findOne(
+      { tokenHash, taskId, userId, usedAt: { $ne: null }, expiresAt: { $gt: new Date() } }
+    ).lean();
+    if (!visitedTicket) {
+      return res.status(400).json({ success: false, message: 'لم يتم تسجيل زيارة صالحة لهذا الرابط. افتح المهمة من الزر ثم حاول مجددًا.' });
+    }
+
+    const dailyDoc = await TaskDailyCounter.findOne({ userId, day: today }).lean();
+    if (dailyDoc && dailyDoc.count >= DAILY_TASK_REWARD_LIMIT) {
+      return res.status(429).json({ success: false, message: `وصلت إلى الحد اليومي (${DAILY_TASK_REWARD_LIMIT} مهام). عد غدًا.`, dailyLimit: DAILY_TASK_REWARD_LIMIT });
+    }
+
+    if (chat) {
+      // التحقق الفعلي: هل المستخدم عضو في القناة/المجموعة الآن؟
+      let membership;
+      try {
+        membership = await checkTelegramMembership(chat.chatId, userId);
+      } catch (err) {
+        console.error('getChatMember verification unavailable:', err.message);
+        return res.status(503).json({ success: false, message: 'تعذر التحقق من الانضمام حاليًا، حاول بعد قليل.' });
+      }
+      if (!membership.isMember) {
+        return res.status(400).json({ success: false, message: 'لم نجد انضمامك للقناة/المجموعة. انضم أولاً ثم اضغط تحقق مرة أخرى.' });
+      }
+    } else if (UNVERIFIABLE_TASK_MIN_WAIT_MS > 0) {
+      // لا توجد طريقة للتحقق من الإنجاز؛ نشترط على الأقل مرور وقت بعد فتح الرابط.
+      const waitedMs = Date.now() - new Date(visitedTicket.usedAt).getTime();
+      if (waitedMs < UNVERIFIABLE_TASK_MIN_WAIT_MS) {
+        const remaining = Math.ceil((UNVERIFIABLE_TASK_MIN_WAIT_MS - waitedMs) / 1000);
+        return res.status(400).json({ success: false, message: `أنجز المهمة أولاً ثم اضغط تحقق بعد ${remaining} ثانية.` });
+      }
+    }
+  } catch (err) {
+    console.error('Task pre-verification failed:', err);
+    return res.status(500).json({ success: false, message: 'تعذر التحقق من المهمة.' });
+  }
+
   const session = await mongoose.startSession();
   let updatedUser;
+  let dailyCompleted = 0;
   try {
     await session.withTransaction(async () => {
       const user = await User.findOne({ telegramId: userId, isBanned: { $ne: true } }).session(session);
       if (!user) { const e = new Error('حساب محظور أو غير موجود'); e.statusCode = 403; throw e; }
+
       const ticket = await TaskVisitTicket.findOneAndUpdate(
         { tokenHash, taskId, userId, usedAt: { $ne: null }, expiresAt: { $gt: new Date() } },
         { $set: { usedAt: new Date() } }, { new: true, session }
       );
       if (!ticket) { const e = new Error('لم يتم تسجيل زيارة صالحة لهذا الرابط. افتح المهمة من الزر ثم حاول مجددًا.'); e.statusCode = 400; throw e; }
+
+      // السقف اليومي بشكل ذري: التحديث لا يطابق إذا بلغ العداد السقف (وقد يؤدي لخطأ تكرار مفتاح عند الـ upsert).
+      let counter;
+      try {
+        counter = await TaskDailyCounter.findOneAndUpdate(
+          { userId, day: today, count: { $lt: DAILY_TASK_REWARD_LIMIT } },
+          { $inc: { count: 1 }, $setOnInsert: { expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000) } },
+          { upsert: true, new: true, session }
+        );
+      } catch (err) {
+        if (err && err.code === 11000) {
+          const e = new Error(`وصلت إلى الحد اليومي (${DAILY_TASK_REWARD_LIMIT} مهام). عد غدًا.`);
+          e.statusCode = 429; throw e;
+        }
+        throw err;
+      }
+      dailyCompleted = counter ? counter.count : 0;
+
       const task = await Task.findOneAndUpdate(
         { _id: taskId, creatorId: { $ne: userId }, completedBy: { $ne: userId }, status: { $ne: 'مكتملة' }, $expr: { $lt: ['$current', '$target'] } },
         { $addToSet: { completedBy: userId }, $inc: { current: 1 } },
@@ -1362,12 +1924,20 @@ app.post('/api/tasks/complete', userRequestAuth, async (req, res) => {
       );
       if (!task) { const e = new Error('المهمة مكتملة أو سبق لك إتمامها أو لا يمكنك إكمال مهمتك الخاصة'); e.statusCode = 400; throw e; }
       if (task.current >= task.target) { task.status = 'مكتملة'; await task.save({ session }); }
+
       updatedUser = await User.findOneAndUpdate(
-        { telegramId: userId, isBanned: { $ne: true } }, { $inc: { gold: 1000 } }, { new: true, session }
+        { telegramId: userId, isBanned: { $ne: true } }, { $inc: { gold: TASK_REWARD_GOLD } }, { new: true, session }
       );
       if (!updatedUser) { const e = new Error('تعذر تحديث رصيد المكافأة'); e.statusCode = 500; throw e; }
     });
-    return res.json({ success: true, rewardGold: 1000, message: 'تم تسجيل زيارة الرابط وإتمام المهمة بنجاح! حصلت على 1000 ذهبة', user: publicUser(updatedUser) });
+    return res.json({
+      success: true,
+      rewardGold: TASK_REWARD_GOLD,
+      dailyCompleted,
+      dailyLimit: DAILY_TASK_REWARD_LIMIT,
+      message: `تم إتمام المهمة بنجاح! حصلت على ${TASK_REWARD_GOLD} ذهبة`,
+      user: publicUser(updatedUser)
+    });
   } catch (err) {
     if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
     console.error('Task completion transaction failed:', err);
