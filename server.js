@@ -7,6 +7,8 @@ require('dotenv').config();
 
 const app = express();
 app.disable('x-powered-by');
+// Railway يضع وسيطًا واحدًا أمام التطبيق؛ بدون هذا السطر سيظهر كل المستخدمين بنفس عنوان IP.
+app.set('trust proxy', 1);
 
 // يمكن تقييد مصادر المتصفح عبر CORS_ORIGINS مفصولة بفواصل في بيئة التشغيل.
 const configuredOrigins = (process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean);
@@ -21,6 +23,73 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '100kb' }));
 
+// --------------------------------------------------
+// تحديد معدل الطلبات (Rate Limiting) دون مكتبات خارجية.
+// المفتاح: هوية Telegram الموثقة إن وُجدت، وإلا عنوان IP.
+// الذاكرة محلية للعملية؛ إن شغّلت أكثر من نسخة فسيُحسب الحد لكل نسخة على حدة.
+// --------------------------------------------------
+const rateLimitStore = new Map();
+
+function rateLimitKeyFor(req) {
+  try {
+    const verified = verifyTelegramInitData(req.get('x-telegram-init-data'));
+    if (verified) return `u:${verified.id}`;
+  } catch (err) {
+    // نرجع إلى IP عند أي خطأ في التحقق.
+  }
+  return `ip:${req.ip}`;
+}
+
+function createRateLimiter(name, windowMs, max, options = {}) {
+  const perIpOnly = Boolean(options.perIpOnly);
+  return function rateLimiter(req, res, next) {
+    const now = Date.now();
+    const key = `${name}|${perIpOnly ? `ip:${req.ip}` : rateLimitKeyFor(req)}`;
+    let entry = rateLimitStore.get(key);
+    if (!entry || entry.resetAt <= now) {
+      entry = { count: 0, resetAt: now + windowMs };
+      rateLimitStore.set(key, entry);
+    }
+    entry.count += 1;
+    if (entry.count > max) {
+      const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.set('Retry-After', String(retryAfter));
+      return res.status(429).json({
+        success: false,
+        message: `طلبات كثيرة جدًا. حاول بعد ${retryAfter} ثانية.`,
+        retryAfter
+      });
+    }
+    return next();
+  };
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (entry.resetAt <= now) rateLimitStore.delete(key);
+  }
+}, 60 * 1000).unref();
+
+// حد عام لكل IP (واسع لأن عدة مستخدمين قد يشتركون في IP واحد)؛ يستثني استطلاع الصاروخ وpostback الخاص بـ Monetag.
+const globalIpLimiter = createRateLimiter('global', 60 * 1000, 600, { perIpOnly: true });
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/games/rocket') || req.path === '/monetag/postback') return next();
+  return globalIpLimiter(req, res, next);
+});
+
+// حدود أضيق للمسارات الحساسة (لكل مستخدم موثق في الدقيقة).
+app.use('/api/promo', createRateLimiter('promo', 60 * 1000, 15));
+app.use('/api/tasks/complete', createRateLimiter('task-complete', 60 * 1000, 20));
+app.use('/api/tasks/visit-ticket', createRateLimiter('task-ticket', 60 * 1000, 40));
+app.use(['/api/wallet/exchange', '/api/wallet/convert'], createRateLimiter('wallet-convert', 60 * 1000, 30));
+app.use(['/api/wallet/withdraw', '/api/wallet/deposit'], createRateLimiter('wallet-money', 60 * 1000, 10));
+app.use(['/api/user/transfer', '/api/transfer', '/api/wallet/transfer'], createRateLimiter('transfer', 60 * 1000, 20));
+app.use('/api/friends/claim', createRateLimiter('friends-claim', 60 * 1000, 20));
+app.use('/api/monetag/start', createRateLimiter('monetag-start', 60 * 1000, 12));
+app.use('/api/user/profile', createRateLimiter('profile', 60 * 1000, 60));
+app.use(['/api/games/rocket/start', '/api/games/rocket/cashout'], createRateLimiter('rocket-action', 60 * 1000, 60));
+
 // لا تضع بيانات MongoDB السرية مباشرة في الكود.
 const MONGO_URI = process.env.MONGO_URI;
 
@@ -31,6 +100,20 @@ if (!MONGO_URI) {
 mongoose.connect(MONGO_URI || 'mongodb://127.0.0.1:27017/moneyslayer')
   .then(() => {
     console.log('✅ تم الاتصال بقاعدة بيانات MongoDB');
+    // الإحالات المسجّلة قبل قاعدة "إكمال المهام" دُفعت مكافأتها فعلًا؛ نعلّمها مؤهّلة كي لا تُدفع مرتين.
+    User.updateMany(
+      { referredBy: { $nin: [null, ''] }, referralQualified: { $exists: false } },
+      { $set: { referralQualified: true, referralQualifiedAt: new Date() } }
+    ).then((r) => {
+      if (r && r.modifiedCount) console.log(`ℹ️ تم ترحيل ${r.modifiedCount} إحالة قديمة إلى حالة مؤهّلة`);
+    }).catch((migrationErr) => console.error('referral migration error:', migrationErr.message));
+    // تحميل إعدادات الصاروخ المحفوظة، مع تحديث دوري كي تتزامن النسخ المتعددة من السيرفر.
+    loadRocketConfig().catch((configErr) => console.error('rocket config load error:', configErr.message));
+    if (!globalThis.__rocketConfigTimer) {
+      globalThis.__rocketConfigTimer = setInterval(() => {
+        loadRocketConfig().catch((configErr) => console.error('rocket config refresh error:', configErr.message));
+      }, 60 * 1000);
+    }
     // محرك الجولات يعمل حتى عند عدم وجود لاعبين متصلين.
     // يبدأ فقط بعد نجاح اتصال قاعدة البيانات، وأخطاء الدورة لا توقف السيرفر.
     if (!globalThis.__rocketRoundTimer) {
@@ -53,10 +136,15 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
 // مكافأة الإحالة الثابتة: 1000 Gold لكل مستخدم جديد تتم إحالته مرة واحدة فقط.
 const REFERRAL_REWARD_GOLD = 1000;
+// عدد المهام المطلوب من الصديق قبل دفع مكافأة الإحالة. 0 = بلا شرط: تُضاف المكافأة فور تسجيل الإحالة.
+// (يمكن إعادة تفعيل الشرط بضبط REFERRAL_QUALIFY_TASKS > 0 وتعديل registerReferral ليعلّم الإحالة غير مؤهلة.)
+const REFERRAL_QUALIFY_TASKS = 0;
 // الصديق يُعد "نشطًا" إذا فتح التطبيق خلال آخر 7 أيام.
 const FRIEND_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-// مكافأة المهام: 1000 Gold لكل مهمة، لكن فقط بعد التحقق الفعلي من الانضمام عبر Telegram Bot API.
+// مكافأة المهام: 1000 Gold (= 0.05$) لكل مهمة، لكن فقط بعد التحقق الفعلي من الانضمام عبر Telegram Bot API.
+// تنبيه: المنشئ يدفع حاليًا 1$ لكل 50 منفّذًا (= 0.02$ للإنجاز)، أي أقل من قيمة هذه المكافأة،
+// فتبقى إمكانية الربح من تدوير الرصيد بحسابات وهمية قائمة ما لم يُرفع سعر إنشاء المهمة (انظر createPaidTask).
 const TASK_REWARD_GOLD = 1000;
 // سقف يومي (بتوقيت UTC) لعدد المهام التي يُكافأ عليها المستخدم؛ الافتراضي 100 وقابل للضبط عبر DAILY_TASK_REWARD_LIMIT.
 const DAILY_TASK_REWARD_LIMIT = Math.max(1, Number.parseInt(process.env.DAILY_TASK_REWARD_LIMIT, 10) || 100);
@@ -66,15 +154,25 @@ const UNVERIFIABLE_TASK_MIN_WAIT_MS = 10 * 1000;
 const TASK_VERIFY_COOLDOWN_MS = 3000;
 
 // إعدادات الصاروخ
-// هامش نظري مستهدف للعبة: 5% على المدى الطويل وفق نموذج الاحتمالات أدناه؛
+// هامش نظري مستهدف للعبة: 15% على المدى الطويل وفق نموذج الاحتمالات أدناه؛
 // ليس ضمانًا لربح المنصة في كل جولة أو فترة قصيرة.
-const ROCKET_HOUSE_EDGE = 0.05;
+const ROCKET_HOUSE_EDGE = 0.15;
 // حقول توافق قديمة للواجهة؛ ليست نسبة فوز مضمونة لكل لاعب.
 const ROCKET_LOSS_RATE = 65;
 const ROCKET_WIN_RATE = 35;
-const ROCKET_MAX_MULTIPLIER = 30;
+const ROCKET_MAX_MULTIPLIER = 20;
 const ROCKET_MIN_BET = 1;
 const ROCKET_MAX_BET = 1000000;
+// الإعدادات الحية للصاروخ: تبدأ بالقيم الافتراضية أعلاه، ثم تُحمَّل من قاعدة البيانات
+// وتُعدَّل من لوحة الأدمن (/api/admin/update-rocket) وتسري على الجولات الجديدة.
+const rocketConfig = {
+  houseEdge: ROCKET_HOUSE_EDGE,
+  maxMultiplier: ROCKET_MAX_MULTIPLIER,
+  minBet: ROCKET_MIN_BET,
+  maxBet: ROCKET_MAX_BET,
+  updatedAt: null,
+  updatedBy: null
+};
 const ROCKET_GROWTH_RATE = 0.12; // سرعة نمو المضاعف
 
 // --------------------------------------------------
@@ -99,6 +197,10 @@ const userSchema = new mongoose.Schema({
   // هوية المستخدم الذي أحال هذا المستخدم؛ تمنع احتساب الإحالة أكثر من مرة.
   referredBy: { type: String, default: null, index: true },
   referralRewardedAt: { type: Date, default: null },
+  // تأهيل الإحالة: يصبح true بعد إكمال هذا المستخدم عددًا كافيًا من المهام ودفع مكافأة المُحيل.
+  // لا نضع default عمدًا؛ الغياب = إحالة قديمة تُرحَّل عند الاتصال بقاعدة البيانات.
+  referralQualified: { type: Boolean },
+  referralQualifiedAt: { type: Date },
   // مكافآت الإحالة المعلّقة (تنتظر ضغط زر الاستلام) والمستلمة سابقًا.
   pendingReferralGold: { type: Number, default: 0 },
   totalReferralGold: { type: Number, default: 0 },
@@ -107,6 +209,16 @@ const userSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
+
+// إحالة معلّقة: تُحفظ عندما يرسل المستخدم الجديد /start ref_<id> للبوت (هوية موثوقة من Telegram)،
+// ثم تُستهلك عند إنشاء حسابه أول مرة في /api/user/profile. تنتهي تلقائيًا بعد 7 أيام.
+const pendingReferralSchema = new mongoose.Schema({
+  telegramId: { type: String, required: true, unique: true },
+  referrerId: { type: String, required: true },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } }
+}, { timestamps: true });
+const PendingReferral = mongoose.model('PendingReferral', pendingReferralSchema);
+const PENDING_REFERRAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const taskSchema = new mongoose.Schema({
   title: { type: String, required: true },
@@ -140,7 +252,33 @@ const taskDailyCounterSchema = new mongoose.Schema({
   expiresAt: { type: Date, required: true, index: { expires: 0 } }
 });
 taskDailyCounterSchema.index({ userId: 1, day: 1 }, { unique: true });
+
 const TaskDailyCounter = mongoose.model('TaskDailyCounter', taskDailyCounterSchema);
+
+// Monetag rewarded-ad attempts and daily limits.
+const MONETAG_ZONE_ID = '12092133';
+const MONETAG_REWARD_GOLD = 500;
+const MONETAG_DAILY_LIMIT = 50;
+const MONETAG_COOLDOWN_MS = 60 * 1000;
+const monetagAttemptSchema = new mongoose.Schema({
+  ymid: { type: String, required: true, unique: true, index: true },
+  userId: { type: String, required: true, index: true },
+  day: { type: String, required: true, index: true },
+  status: { type: String, enum: ['pending', 'rewarded', 'rejected'], default: 'pending' },
+  createdAt: { type: Date, default: Date.now },
+  rewardedAt: { type: Date, default: null }
+});
+monetagAttemptSchema.index({ userId: 1, day: 1, createdAt: -1 });
+const MonetagAttempt = mongoose.model('MonetagAttempt', monetagAttemptSchema);
+const monetagDailySchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  day: { type: String, required: true },
+  count: { type: Number, default: 0 },
+  lastStartedAt: { type: Date, default: null }
+});
+monetagDailySchema.index({ userId: 1, day: 1 }, { unique: true });
+const MonetagDaily = mongoose.model('MonetagDaily', monetagDailySchema);
+
 
 
 const promoSchema = new mongoose.Schema({
@@ -171,6 +309,24 @@ const platformFeeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 const PlatformFee = mongoose.model('PlatformFee', platformFeeSchema);
+
+// سجل إيرادات المنصة الناتجة عن رسوم تحويل العملات. كل عملية تُسجَّل بعملتها الأصلية:
+// - إذا كان التحويل من الذهب: الرسوم تُحتسب بالذهب (currency = 'gold').
+// - إذا كان التحويل من عملة أخرى (USDT/GRAM/TRX/BTC/ETH/SOL): الرسوم تُحتسب بالدولار (currency = 'usd').
+// يُسجَّل أيضًا تفصيل التحويل ليظهر ضمن نشاطات المستخدم في لوحة الإدارة.
+const platformRevenueSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  source: { type: String, required: true, default: 'convert_fee', index: true },
+  currency: { type: String, enum: ['gold', 'usd'], required: true, index: true },
+  amount: { type: Number, required: true, min: 0 },
+  from: { type: String, default: null },
+  to: { type: String, default: null },
+  sourceAmount: { type: Number, default: 0 },
+  receivedAmount: { type: Number, default: 0 },
+  usdValue: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now }
+});
+const PlatformRevenue = mongoose.model('PlatformRevenue', platformRevenueSchema);
 
 const transactionSchema = new mongoose.Schema({
   txId: { type: String, required: true },
@@ -234,6 +390,184 @@ const rocketBetSchema = new mongoose.Schema({
 rocketBetSchema.index({ roundId: 1, userId: 1, betSlot: 1 }, { unique: true });
 rocketBetSchema.index({ roundId: 1, status: 1 });
 const RocketBet = mongoose.model('RocketBet', rocketBetSchema);
+
+// --------------------------------------------------
+// السجل المالي الموحّد (Ledger)
+// كل تغيير في أي رصيد يُسجَّل هنا بإشارة (+ إضافة / - خصم) مع الرصيد بعد العملية.
+// العمليات داخل معاملات MongoDB تُسجَّل ضمن نفس المعاملة (ذرية)، وغيرها تُسجَّل بعد نجاحها دون إيقاف العملية عند الفشل.
+// --------------------------------------------------
+const ledgerEntrySchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  type: { type: String, required: true, index: true },
+  // اسم حقل الرصيد في المستخدم: gold | balance | diamonds | trx | btc | eth | sol
+  currency: { type: String, required: true, index: true },
+  amount: { type: Number, required: true },
+  balanceAfter: { type: Number, default: null },
+  // مفتاح يربط القيد بالعملية الأصلية (مهمة، رهان، رمز...) ويمنع تكرار العرض.
+  refKey: { type: String, default: null, index: true },
+  description: { type: String, default: '' },
+  meta: { type: mongoose.Schema.Types.Mixed, default: null },
+  createdAt: { type: Date, default: Date.now, index: true }
+});
+ledgerEntrySchema.index({ userId: 1, createdAt: -1 });
+ledgerEntrySchema.index({ type: 1, createdAt: -1 });
+const LedgerEntry = mongoose.model('LedgerEntry', ledgerEntrySchema);
+
+async function recordLedger(entries, options = {}) {
+  const list = (Array.isArray(entries) ? entries : [entries])
+    .filter((entry) => entry && entry.userId && entry.currency && Number.isFinite(Number(entry.amount)) && Number(entry.amount) !== 0)
+    .map((entry) => ({
+      userId: String(entry.userId),
+      type: String(entry.type),
+      currency: String(entry.currency),
+      amount: Number(entry.amount),
+      balanceAfter: Number.isFinite(Number(entry.balanceAfter)) ? Number(entry.balanceAfter) : null,
+      refKey: entry.refKey ? String(entry.refKey) : null,
+      description: String(entry.description || '').slice(0, 300),
+      meta: entry.meta || null
+    }));
+  if (!list.length) return;
+  if (options.session) {
+    // داخل معاملة: أي فشل يُلغي المعاملة كلها كي لا يتغير رصيد بلا قيد.
+    await LedgerEntry.create(list, { session: options.session, ordered: true });
+    return;
+  }
+  try {
+    await LedgerEntry.create(list);
+  } catch (ledgerErr) {
+    console.error('ledger write error:', ledgerErr.message);
+  }
+}
+
+// سجل تدقيق لإجراءات الأدمن الحساسة.
+const adminAuditSchema = new mongoose.Schema({
+  adminId: { type: String, required: true },
+  action: { type: String, required: true, index: true },
+  target: { type: String, default: null },
+  details: { type: mongoose.Schema.Types.Mixed, default: null },
+  createdAt: { type: Date, default: Date.now, index: true }
+});
+const AdminAudit = mongoose.model('AdminAudit', adminAuditSchema);
+
+async function recordAdminAudit(adminId, action, target, details) {
+  try {
+    await AdminAudit.create({ adminId: String(adminId), action, target: target ? String(target) : null, details: details || null });
+  } catch (auditErr) {
+    console.error('admin audit write error:', auditErr.message);
+  }
+}
+
+// --------------------------------------------------
+// إعدادات الصاروخ المخزنة في قاعدة البيانات
+// --------------------------------------------------
+const rocketSettingsSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true, default: 'rocket' },
+  houseEdge: { type: Number, required: true },
+  maxMultiplier: { type: Number, required: true },
+  minBet: { type: Number, required: true },
+  maxBet: { type: Number, required: true },
+  updatedBy: { type: String, default: null },
+  updatedAt: { type: Date, default: Date.now }
+});
+const RocketSettings = mongoose.model('RocketSettings', rocketSettingsSchema);
+
+const ROCKET_LIMITS = {
+  houseEdgePercent: { min: 0.5, max: 30 },
+  maxMultiplier: { min: 1.5, max: 100 },
+  minBet: { min: 1, max: 1000000000 },
+  maxBet: { min: 1, max: 1000000000 }
+};
+
+function applyRocketConfig(values) {
+  if (!values) return;
+  const edge = Number(values.houseEdge);
+  const maxMultiplier = Number(values.maxMultiplier);
+  const minBet = Number(values.minBet);
+  const maxBet = Number(values.maxBet);
+  if (Number.isFinite(edge) && edge >= ROCKET_LIMITS.houseEdgePercent.min / 100 && edge <= ROCKET_LIMITS.houseEdgePercent.max / 100) {
+    rocketConfig.houseEdge = edge;
+  }
+  if (Number.isFinite(maxMultiplier) && maxMultiplier >= ROCKET_LIMITS.maxMultiplier.min && maxMultiplier <= ROCKET_LIMITS.maxMultiplier.max) {
+    rocketConfig.maxMultiplier = maxMultiplier;
+  }
+  if (Number.isSafeInteger(minBet) && Number.isSafeInteger(maxBet) && minBet >= 1 && maxBet >= minBet) {
+    rocketConfig.minBet = minBet;
+    rocketConfig.maxBet = maxBet;
+  }
+  rocketConfig.updatedAt = values.updatedAt || rocketConfig.updatedAt;
+  rocketConfig.updatedBy = values.updatedBy || rocketConfig.updatedBy;
+}
+
+async function loadRocketConfig() {
+  if (mongoose.connection.readyState !== 1) return;
+  const doc = await RocketSettings.findOne({ key: 'rocket' }).lean();
+  if (doc) applyRocketConfig(doc);
+}
+
+function publicRocketConfig() {
+  return {
+    // حقول توافق قديمة للواجهة؛ ليست نسبة فوز مضمونة لكل لاعب.
+    lossRate: ROCKET_LOSS_RATE,
+    winRate: ROCKET_WIN_RATE,
+    houseEdge: rocketConfig.houseEdge,
+    houseEdgePercent: Math.round(rocketConfig.houseEdge * 10000) / 100,
+    maxMultiplier: rocketConfig.maxMultiplier,
+    minBet: rocketConfig.minBet,
+    maxBet: rocketConfig.maxBet,
+    updatedAt: rocketConfig.updatedAt,
+    updatedBy: rocketConfig.updatedBy
+  };
+}
+
+// يتحقق من القيم المرسلة (النسبة المئوية للهامش، المضاعف الأقصى، حدّا الرهان) ويعيد القيم المدمجة مع الحالية.
+function parseRocketSettingsInput(body) {
+  const next = {
+    houseEdge: rocketConfig.houseEdge,
+    maxMultiplier: rocketConfig.maxMultiplier,
+    minBet: rocketConfig.minBet,
+    maxBet: rocketConfig.maxBet
+  };
+  let changed = false;
+
+  if (body.houseEdgePercent !== undefined) {
+    const percent = Number(body.houseEdgePercent);
+    const { min, max } = ROCKET_LIMITS.houseEdgePercent;
+    if (!Number.isFinite(percent) || percent < min || percent > max) {
+      return { error: `هامش المنصة يجب أن يكون بين ${min}% و${max}%.` };
+    }
+    next.houseEdge = Math.round(percent * 100) / 10000;
+    changed = true;
+  }
+  if (body.maxMultiplier !== undefined) {
+    const multiplier = Number(body.maxMultiplier);
+    const { min, max } = ROCKET_LIMITS.maxMultiplier;
+    if (!Number.isFinite(multiplier) || multiplier < min || multiplier > max) {
+      return { error: `المضاعف الأقصى يجب أن يكون بين ${min} و${max}.` };
+    }
+    next.maxMultiplier = Math.round(multiplier * 100) / 100;
+    changed = true;
+  }
+  if (body.minBet !== undefined) {
+    const minBet = Number(body.minBet);
+    if (!Number.isSafeInteger(minBet) || minBet < ROCKET_LIMITS.minBet.min || minBet > ROCKET_LIMITS.minBet.max) {
+      return { error: 'الحد الأدنى للرهان يجب أن يكون عددًا صحيحًا موجبًا.' };
+    }
+    next.minBet = minBet;
+    changed = true;
+  }
+  if (body.maxBet !== undefined) {
+    const maxBet = Number(body.maxBet);
+    if (!Number.isSafeInteger(maxBet) || maxBet < ROCKET_LIMITS.maxBet.min || maxBet > ROCKET_LIMITS.maxBet.max) {
+      return { error: 'الحد الأقصى للرهان يجب أن يكون عددًا صحيحًا موجبًا.' };
+    }
+    next.maxBet = maxBet;
+    changed = true;
+  }
+  if (next.maxBet < next.minBet) {
+    return { error: 'الحد الأقصى للرهان يجب ألا يقل عن الحد الأدنى.' };
+  }
+  return { values: next, changed };
+}
 
 // --------------------------------------------------
 // أدوات مساعدة
@@ -390,15 +724,15 @@ function calculateMultiplier(startedAt, now = Date.now()) {
   return Number(Math.exp(ROCKET_GROWTH_RATE * elapsedSeconds).toFixed(2));
 }
 
-// يولّد نقطة الانهيار بتوزيع ذي هامش نظري مستهدف 5% عند السحب على مضاعف ثابت.
+// يولّد نقطة الانهيار بتوزيع ذي هامش نظري مستهدف 15% عند السحب على مضاعف ثابت.
 // توجد احتمالية لانهيار فوري تحت 1.00x؛ وهذا مقصود في نموذج Crash القياسي.
-// سقف 30x يعني أن احتمال تجاوز السقف يُجمع عند 30x، ولا يضمن وصول كل جولة إليه.
+// سقف 20x يعني أن احتمال تجاوز السقف يُجمع عند 20x، ولا يضمن وصول كل جولة إليه.
 // النتيجة مستقلة عن هوية اللاعب وحجم رهانه، ولا تُعد نسبة فوز ثابتة لكل لاعب.
 function generateCrashMultiplier() {
   // rand في المجال (0, 1] لتجنب القسمة على صفر.
   const rand = (crypto.randomInt(0, 1000000) + 1) / 1000000;
-  const rawMultiplier = (1 - ROCKET_HOUSE_EDGE) / rand;
-  const cappedMultiplier = Math.min(ROCKET_MAX_MULTIPLIER, rawMultiplier);
+  const rawMultiplier = (1 - rocketConfig.houseEdge) / rand;
+  const cappedMultiplier = Math.min(rocketConfig.maxMultiplier, rawMultiplier);
   return Number(Math.max(0.01, cappedMultiplier).toFixed(2));
 }
 
@@ -503,7 +837,19 @@ app.get('/api/user/profile', userRequestAuth, async (req, res) => {
     }
 
     // تسجيل الإحالة تلقائيًا عند أول دخول عبر رابط ?startapp=ref_<id>.
-    const referrerFromLink = parseReferralParam(verifiedTelegramUser?.start_param);
+    let referrerFromLink = parseReferralParam(verifiedTelegramUser?.start_param);
+    if (isNewUser && !referrerFromLink) {
+      // الدخول عبر زر البوت لا يحمل start_param؛ نقرأ الإحالة التي سجّلها أمر /start ref_<id>.
+      try {
+        const pending = await PendingReferral.findOne({
+          telegramId: user.telegramId,
+          expiresAt: { $gt: new Date() }
+        }).lean();
+        referrerFromLink = pending ? pending.referrerId : null;
+      } catch (pendingErr) {
+        console.error('pending referral lookup error:', pendingErr.message);
+      }
+    }
     if (isNewUser && referrerFromLink) {
       try {
         const referralResult = await registerReferral(user.telegramId, referrerFromLink);
@@ -513,6 +859,10 @@ app.get('/api/user/profile', userRequestAuth, async (req, res) => {
       } catch (refErr) {
         console.error('auto referral error:', refErr.message);
       }
+    }
+    if (isNewUser) {
+      PendingReferral.deleteOne({ telegramId: user.telegramId })
+        .catch((delErr) => console.error('pending referral cleanup error:', delErr.message));
     }
 
     res.json({ success: true, user });
@@ -562,7 +912,7 @@ app.get('/api/referrals/stats', userRequestAuth, async (req, res) => {
 
     // نعتمد على سجلات المستخدمين المرتبطين فعليًا بهذا المُحيل، لا على عداد قديم فقط.
     const referrals = await User.find({ referredBy: ownerId })
-      .select('telegramId name createdAt referralRewardedAt')
+      .select('telegramId name createdAt referralRewardedAt referralQualified')
       .sort({ createdAt: -1 })
       .lean();
 
@@ -573,10 +923,11 @@ app.get('/api/referrals/stats', userRequestAuth, async (req, res) => {
         userId: item.telegramId,
         name: item.name,
         createdAt: item.createdAt,
-        rewarded: Boolean(item.referralRewardedAt)
+        rewarded: Boolean(item.referralQualified),
+        requiredTasks: REFERRAL_QUALIFY_TASKS
       })),
       rewardPerReferral: REFERRAL_REWARD_GOLD,
-      totalReferralGold: referrals.filter((item) => item.referralRewardedAt).length * REFERRAL_REWARD_GOLD,
+      totalReferralGold: referrals.filter((item) => item.referralQualified).length * REFERRAL_REWARD_GOLD,
       gold: user.gold
     });
   } catch (err) {
@@ -599,59 +950,98 @@ async function registerReferral(referredUserId, ownerId) {
     return { success: false, status: 400, message: 'رابط الإحالة غير صالح' };
   }
 
-  const session = await mongoose.startSession();
+  // لا نستخدم withTransaction هنا: كانت تفشل على MongoDB غير المهيأ كـ Replica Set
+  // بعد أن يكون حساب الصديق قد حُفظ، فتضيع الإحالة نهائيًا. نستخدم تحديثات ذرية مع تراجع يدوي.
+  const [referredUser, referrer] = await Promise.all([
+    User.findOne({ telegramId: referredUserId }),
+    User.findOne({ telegramId: ownerId })
+  ]);
+
+  if (!referredUser) return { success: false, status: 404, message: 'يجب إنشاء حساب المستخدم أولاً' };
+  if (!referrer || referrer.isBanned) return { success: false, status: 404, message: 'المُحيل غير موجود أو محظور' };
+  if (referredUser.isBanned) return { success: false, status: 403, message: 'المستخدم محظور' };
+  if (referredUser.referredBy || referredUser.referralRewardedAt) {
+    return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
+  }
+
+  const claimedUser = await User.findOneAndUpdate(
+    {
+      telegramId: referredUserId,
+      isBanned: { $ne: true },
+      $and: [
+        { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
+        { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
+      ]
+    },
+    { $set: { referredBy: ownerId, referralRewardedAt: new Date(), referralQualified: true, referralQualifiedAt: new Date() } },
+    { new: true }
+  );
+  if (!claimedUser) return { success: false, status: 409, message: 'تم تسجيل إحالة هذا المستخدم مسبقًا' };
+
   try {
-    let result;
-    await session.withTransaction(async () => {
-      const [referredUser, referrer] = await Promise.all([
-        User.findOne({ telegramId: referredUserId }).session(session),
-        User.findOne({ telegramId: ownerId }).session(session)
-      ]);
+    const updatedReferrer = await User.findOneAndUpdate(
+      { telegramId: ownerId, isBanned: { $ne: true } },
+      { $inc: { referralCount: 1, pendingReferralGold: REFERRAL_REWARD_GOLD } },
+      { new: true }
+    );
+    if (!updatedReferrer) throw new Error('تعذر تحديث حساب المُحيل');
 
-      if (!referredUser) { const e = new Error('يجب إنشاء حساب المستخدم أولاً'); e.statusCode = 404; throw e; }
-      if (!referrer || referrer.isBanned) { const e = new Error('المُحيل غير موجود أو محظور'); e.statusCode = 404; throw e; }
-      if (referredUser.isBanned) { const e = new Error('المستخدم محظور'); e.statusCode = 403; throw e; }
-      if (referredUser.referredBy || referredUser.referralRewardedAt) {
-        const e = new Error('تم تسجيل إحالة هذا المستخدم مسبقًا'); e.statusCode = 409; throw e;
-      }
-
-      const claimedUser = await User.findOneAndUpdate(
-        {
-          telegramId: referredUserId,
-          isBanned: { $ne: true },
-          $and: [
-            { $or: [{ referredBy: null }, { referredBy: { $exists: false } }] },
-            { $or: [{ referralRewardedAt: null }, { referralRewardedAt: { $exists: false } }] }
-          ]
-        },
-        { $set: { referredBy: ownerId, referralRewardedAt: new Date() } },
-        { new: true, session }
-      );
-      if (!claimedUser) { const e = new Error('تم تسجيل إحالة هذا المستخدم مسبقًا'); e.statusCode = 409; throw e; }
-
-      const updatedReferrer = await User.findOneAndUpdate(
-        { telegramId: ownerId, isBanned: { $ne: true } },
-        { $inc: { referralCount: 1, pendingReferralGold: REFERRAL_REWARD_GOLD } },
-        { new: true, session }
-      );
-      if (!updatedReferrer) { const e = new Error('تعذر تحديث حساب المُحيل'); e.statusCode = 404; throw e; }
-
-      result = {
-        success: true,
-        status: 200,
-        message: 'تم تسجيل الإحالة وإضافة المكافأة إلى رصيدك المعلّق',
-        reward: REFERRAL_REWARD_GOLD,
-        referralCount: updatedReferrer.referralCount,
-        pendingReward: updatedReferrer.pendingReferralGold
-      };
-    });
-    return result;
+    return {
+      success: true,
+      status: 200,
+      message: 'تم تسجيل الإحالة وإضافة المكافأة إلى رصيدك المعلّق',
+      reward: REFERRAL_REWARD_GOLD,
+      referralCount: updatedReferrer.referralCount,
+      pendingReward: updatedReferrer.pendingReferralGold
+    };
   } catch (err) {
-    if (err.statusCode) return { success: false, status: err.statusCode, message: err.message };
-    console.error('referral transaction failed:', err);
-    throw err;
-  } finally {
-    await session.endSession();
+    console.error('referral reward failed, rolling back claim:', err.message);
+    await User.updateOne(
+      { telegramId: referredUserId, referredBy: ownerId },
+      { $set: { referredBy: null, referralRewardedAt: null, referralQualified: false }, $unset: { referralQualifiedAt: '' } }
+    ).catch((rollbackErr) => console.error('referral rollback failed:', rollbackErr.message));
+    return { success: false, status: 500, message: 'تعذر تسجيل الإحالة حاليًا' };
+  }
+}
+
+// يُستدعى بعد كل مهمة ينجزها المستخدم: إذا بلغ عدد مهامه الحد المطلوب تُضاف مكافأة الإحالة للمُحيل مرة واحدة فقط.
+async function qualifyReferralIfEligible(userId) {
+  userId = String(userId);
+  const friend = await User.findOne({
+    telegramId: userId,
+    isBanned: { $ne: true },
+    referredBy: { $nin: [null, ''] },
+    referralQualified: false
+  }).select('referredBy').lean();
+  if (!friend) return null;
+
+  const completedTasks = await Task.countDocuments({ completedBy: userId });
+  if (completedTasks < REFERRAL_QUALIFY_TASKS) return null;
+
+  // علامة ذرية: تمنع دفع المكافأة مرتين عند إكمال مهمتين بالتزامن.
+  const claimed = await User.findOneAndUpdate(
+    { telegramId: userId, referralQualified: false },
+    { $set: { referralQualified: true, referralQualifiedAt: new Date() } },
+    { new: true }
+  );
+  if (!claimed) return null;
+
+  const referrerId = String(friend.referredBy);
+  try {
+    const referrer = await User.findOneAndUpdate(
+      { telegramId: referrerId, isBanned: { $ne: true } },
+      { $inc: { pendingReferralGold: REFERRAL_REWARD_GOLD } },
+      { new: true }
+    );
+    if (!referrer) throw new Error('المُحيل غير متاح أو محظور');
+    return { referrerId, reward: REFERRAL_REWARD_GOLD };
+  } catch (err) {
+    console.error('referral qualification failed, rolling back:', err.message);
+    await User.updateOne(
+      { telegramId: userId, referralQualified: true },
+      { $set: { referralQualified: false }, $unset: { referralQualifiedAt: '' } }
+    ).catch((rollbackErr) => console.error('referral qualification rollback failed:', rollbackErr.message));
+    return null;
   }
 }
 
@@ -693,7 +1083,7 @@ app.get('/api/friends/list', telegramAuth, async (req, res) => {
     if (owner?.isBanned) return res.status(403).json({ success: false, message: 'حساب محظور' });
 
     const friends = await User.find({ referredBy: ownerId })
-      .select('telegramId name createdAt lastActiveAt')
+      .select('telegramId name createdAt lastActiveAt referralQualified')
       .sort({ createdAt: -1 })
       .limit(500)
       .lean();
@@ -704,7 +1094,9 @@ app.get('/api/friends/list', telegramAuth, async (req, res) => {
       friends: friends.map((friend) => ({
         telegramId: friend.telegramId,
         name: friend.name,
-        earnedGold: REFERRAL_REWARD_GOLD,
+        earnedGold: friend.referralQualified ? REFERRAL_REWARD_GOLD : 0,
+        qualified: Boolean(friend.referralQualified),
+        requiredTasks: REFERRAL_QUALIFY_TASKS,
         isActive: now - new Date(friend.lastActiveAt || friend.createdAt).getTime() <= FRIEND_ACTIVE_WINDOW_MS,
         joinedAt: friend.createdAt
       })),
@@ -744,6 +1136,10 @@ app.post('/api/friends/claim', telegramAuth, async (req, res) => {
     const claimedAmount = Number(before.pendingReferralGold) || 0;
     const { stats } = await friendsStatsFor(ownerId);
     const user = await User.findOne({ telegramId: ownerId });
+    await recordLedger({
+      userId: String(ownerId), type: 'referral_claim', currency: 'gold', amount: claimedAmount, balanceAfter: user?.gold,
+      refKey: `referral-claim:${ownerId}:${Date.now()}`, description: 'استلام مكافآت الإحالة'
+    });
 
     res.json({ success: true, claimedAmount, stats, gold: user?.gold, user: publicUser(user) });
   } catch (err) {
@@ -760,12 +1156,21 @@ app.post('/api/friends/claim', telegramAuth, async (req, res) => {
 
 // سعر الذهب ثابت: كل 100,000 ذهب = 5$ (أي 20,000 ذهب = 1$).
 const GOLD_PER_USD = 20000;
+if (TASK_REWARD_GOLD / GOLD_PER_USD >= 1 / 50) {
+  console.error('⚠️ مكافأة المهمة تساوي أو تتجاوز تكلفتها على المنشئ؛ خفّض TASK_REWARD_GOLD لتفادي الخسارة.');
+}
 // الحد الأدنى لقيمة أي عملية تحويل بالدولار (200 ذهب = 0.01$).
 const MIN_CONVERT_USD = 0.01;
 // رسوم التحويل بين العملات (0 = بدون رسوم، 0.01 = 1%). يمكن ضبطها من WALLET_CONVERT_FEE_RATE.
+// الافتراضي 1% لتغطية تأخر الأسعار (حتى 30 ثانية) ومنع المراجحة بين العملات؛ اضبط المتغير على 0 لإلغائها.
 const WALLET_CONVERT_FEE_RATE = Math.min(
   0.5,
-  Math.max(0, Number(process.env.WALLET_CONVERT_FEE_RATE) || 0)
+  Math.max(
+    0,
+    process.env.WALLET_CONVERT_FEE_RATE !== undefined && process.env.WALLET_CONVERT_FEE_RATE !== ''
+      ? (Number(process.env.WALLET_CONVERT_FEE_RATE) || 0)
+      : 0.01
+  )
 );
 
 const PRICE_CACHE_TTL_MS = 30 * 1000;          // أقصى عمر للسعر قبل تحديثه عند الطلب
@@ -1087,6 +1492,31 @@ async function performWalletConversion(userId, fromRaw, toRaw, amountRaw) {
     return { status: 400, body: { success: false, message: `رصيد ${from} غير كافٍ.` } };
   }
 
+  // تسجيل رسوم التحويل كإيراد للمنصة (الذهب بالذهب، وغيره بالدولار)، وتسجيل قيدي التحويل في السجل المالي.
+  // فشل التسجيل لا يوقف التحويل.
+  let conversionRef = `convert:${telegramId}:${Date.now()}`;
+  try {
+    const feeInGold = from === 'GOLD';
+    const revenueDoc = await PlatformRevenue.create({
+      userId: telegramId,
+      source: 'convert_fee',
+      currency: feeInGold ? 'gold' : 'usd',
+      amount: feeInGold ? amount * WALLET_CONVERT_FEE_RATE : usdValue * WALLET_CONVERT_FEE_RATE,
+      from,
+      to,
+      sourceAmount: amount,
+      receivedAmount: received,
+      usdValue
+    });
+    conversionRef = `convert:${revenueDoc._id}`;
+  } catch (revenueErr) {
+    console.error('platform revenue log error:', revenueErr.message);
+  }
+  await recordLedger([
+    { userId: telegramId, type: 'convert_out', currency: fromField, amount: -amount, balanceAfter: updatedUser[fromField], refKey: conversionRef, description: `تحويل ${amount} ${from} إلى ${received} ${to}`, meta: { from, to, usdValue } },
+    { userId: telegramId, type: 'convert_in', currency: toField, amount: received, balanceAfter: updatedUser[toField], refKey: conversionRef, description: `تحويل ${amount} ${from} إلى ${received} ${to}`, meta: { from, to, usdValue } }
+  ]);
+
   return {
     status: 200,
     body: {
@@ -1260,6 +1690,11 @@ const handleTransfer = async (req, res) => {
         e.statusCode = 400;
         throw e;
       }
+      const transferRef = `transfer:${crypto.randomBytes(8).toString('hex')}`;
+      await recordLedger([
+        { userId: String(userId), type: 'transfer_out', currency: transferType, amount: -transferAmount, balanceAfter: updatedSender[transferType], refKey: transferRef, description: `تحويل إلى ${targetId}`, meta: { counterparty: targetId } },
+        { userId: targetId, type: 'transfer_in', currency: transferType, amount: transferAmount, balanceAfter: recipient[transferType], refKey: transferRef, description: `تحويل من ${userId}`, meta: { counterparty: String(userId) } }
+      ], { session });
     });
 
     return res.json({ success: true, message: 'تم التحويل بنجاح', sender: publicUser(updatedSender) });
@@ -1389,6 +1824,10 @@ app.post('/api/wallet/withdraw', userRequestAuth, async (req, res) => {
         details: String(details || 'طلب سحب').slice(0, 1000),
         status: 'pending'
       }).save({ session });
+      await recordLedger({
+        userId: String(userId), type: 'withdraw_hold', currency: 'balance', amount: -withdrawalAmount, balanceAfter: reservedUser.balance,
+        refKey: `tx:${txId}`, description: 'حجز مبلغ طلب سحب'
+      }, { session });
     });
 
     return res.json({ success: true, txId, message: 'تم إرسال طلب السحب للمراجعة، وحُجز المبلغ حتى تتم المراجعة.' });
@@ -1479,6 +1918,11 @@ async function redeemPromo(req, res, responseKey = 'reward') {
       return res.status(403).json({ success: false, message: 'الحساب محظور أو غير موجود' });
     }
 
+    await recordLedger({
+      userId: String(userId), type: 'promo_redeem', currency: rewardType, amount: reward, balanceAfter: creditedUser[rewardType],
+      refKey: `promo-use:${promo._id}`, description: `تفعيل الرمز ${cleanCode}`
+    });
+
     res.json({
       success: true,
       [responseKey]: reward,
@@ -1567,6 +2011,10 @@ app.post('/api/promo/create', userRequestAuth, async (req, res) => {
         rate: 5
       }).save();
       createdFeeId = feeRecord._id;
+      await recordLedger([
+        { userId: authenticatedUserId, type: 'promo_create', currency: 'gold', amount: -distributionTotal, balanceAfter: chargedUser.gold, refKey: `promo-create:${createdPromoId}`, description: `تمويل الرمز ${cleanCode}` },
+        { userId: authenticatedUserId, type: 'promo_fee', currency: 'gold', amount: -fee, balanceAfter: chargedUser.gold, refKey: `promo-create:${createdPromoId}`, description: `رسوم المنصة 5% للرمز ${cleanCode}` }
+      ]);
 
       return res.json({
         success: true,
@@ -1596,6 +2044,153 @@ app.post('/api/promo/create', userRequestAuth, async (req, res) => {
   } catch (err) {
     console.error('promo creation error:', err);
     return res.status(500).json({ success: false, message: 'فشل إنشاء الرمز؛ إذا خُصم الرصيد فتحقق من سجل الرصيد قبل إعادة المحاولة' });
+  }
+});
+
+
+// --------------------------------------------------
+// Monetag rewarded ads: 500 Gold, max 50/day, 60-second cooldown.
+// Real rewards are granted only from a validated Monetag postback.
+// Configure MONETAG_POSTBACK_SECRET in the server environment.
+app.get('/api/monetag/status', userRequestAuth, async (req, res) => {
+  try {
+    const userId = String(req.telegramUser.id);
+    const day = new Date().toISOString().slice(0, 10);
+    const doc = await MonetagDaily.findOne({ userId, day }).lean();
+    const now = Date.now();
+    const last = doc?.lastStartedAt ? new Date(doc.lastStartedAt).getTime() : 0;
+    const waitSeconds = Math.max(0, Math.ceil((last + MONETAG_COOLDOWN_MS - now) / 1000));
+    res.json({ success: true, rewardGold: MONETAG_REWARD_GOLD, dailyLimit: MONETAG_DAILY_LIMIT,
+      adsToday: Number(doc?.count || 0), waitSeconds, remaining: Math.max(0, MONETAG_DAILY_LIMIT - Number(doc?.count || 0)) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'تعذر جلب حالة إعلانات المكافآت.' });
+  }
+});
+
+app.post('/api/monetag/start', userRequestAuth, async (req, res) => {
+  try {
+    const userId = String(req.telegramUser.id);
+    const day = new Date().toISOString().slice(0, 10);
+    const now = new Date();
+
+    // إنشاء سجل اليوم إن لم يوجد (آمن مع الطلبات المتزامنة بفضل الفهرس الفريد).
+    try {
+      await MonetagDaily.updateOne(
+        { userId, day },
+        { $setOnInsert: { count: 0, lastStartedAt: null } },
+        { upsert: true }
+      );
+    } catch (upsertErr) {
+      if (!(upsertErr && upsertErr.code === 11000)) throw upsertErr;
+    }
+
+    // حجز ذري: يفشل إذا بلغ الحد اليومي أو لم ينتهِ المؤقت، فلا يمكن تجاوزهما بطلبات متزامنة.
+    const cooldownEdge = new Date(now.getTime() - MONETAG_COOLDOWN_MS);
+    const daily = await MonetagDaily.findOneAndUpdate(
+      {
+        userId,
+        day,
+        count: { $lt: MONETAG_DAILY_LIMIT },
+        $or: [{ lastStartedAt: null }, { lastStartedAt: { $lte: cooldownEdge } }]
+      },
+      { $inc: { count: 1 }, $set: { lastStartedAt: now } },
+      { new: true }
+    );
+
+    if (!daily) {
+      const current = await MonetagDaily.findOne({ userId, day }).lean();
+      if (current && Number(current.count) >= MONETAG_DAILY_LIMIT) {
+        return res.status(429).json({ success: false, message: 'وصلت إلى الحد اليومي: 50 إعلانًا.', adsToday: current.count, remaining: 0 });
+      }
+      const last = current && current.lastStartedAt ? new Date(current.lastStartedAt).getTime() : 0;
+      const waitSeconds = Math.max(1, Math.ceil((last + MONETAG_COOLDOWN_MS - now.getTime()) / 1000));
+      return res.status(429).json({ success: false, message: 'انتظر انتهاء المؤقت قبل مشاهدة الإعلان التالي.', waitSeconds });
+    }
+
+    const ymid = crypto.randomUUID();
+    try {
+      await MonetagAttempt.create({ ymid, userId, day, status: 'pending' });
+    } catch (attemptErr) {
+      // لا نستهلك حصة المستخدم إذا تعذر تسجيل المحاولة.
+      await MonetagDaily.updateOne({ userId, day, count: { $gt: 0 } }, { $inc: { count: -1 } })
+        .catch((rollbackErr) => console.error('Monetag counter rollback failed:', rollbackErr.message));
+      throw attemptErr;
+    }
+    res.json({ success: true, ymid, zoneId: MONETAG_ZONE_ID, rewardGold: MONETAG_REWARD_GOLD, adsToday: daily.count, remaining: Math.max(0, MONETAG_DAILY_LIMIT - daily.count) });
+  } catch (err) {
+    console.error('Monetag start error:', err.message);
+    res.status(500).json({ success: false, message: 'تعذر بدء الإعلان حاليًا.' });
+  }
+});
+
+// Monetag Postback endpoint. In Monetag, configure macros in the URL:
+// ?key=YOUR_SECRET&telegram_id={telegram_id}&zone_id={zone_id}&event_type={event_type}&reward_event_type={reward_event_type}&ymid={ymid}
+app.get('/api/monetag/postback', async (req, res) => {
+  try {
+    const secret = String(process.env.MONETAG_POSTBACK_SECRET || '');
+    const suppliedKey = Buffer.from(String(req.query.key || ''));
+    const expectedKey = Buffer.from(secret);
+    if (!secret || suppliedKey.length !== expectedKey.length ||
+        !crypto.timingSafeEqual(suppliedKey, expectedKey)) {
+      return res.status(403).send('forbidden');
+    }
+    if (String(req.query.zone_id || '') !== MONETAG_ZONE_ID ||
+        String(req.query.event_type || '') !== 'impression' ||
+        String(req.query.reward_event_type || '') !== 'valued') {
+      return res.status(200).send('ignored');
+    }
+    const ymid = String(req.query.ymid || '');
+    if (!ymid || ymid.length > 128) return res.status(400).send('invalid ymid');
+    const attempt = await MonetagAttempt.findOne({ ymid });
+    if (!attempt) return res.status(404).send('unknown ymid');
+    if (String(req.query.telegram_id || '') !== attempt.userId) return res.status(403).send('user mismatch');
+    if (attempt.status === 'rewarded') return res.status(200).send('duplicate');
+    if (attempt.status !== 'pending') return res.status(200).send('ignored');
+    const userExists = await User.exists({ telegramId: attempt.userId });
+    if (!userExists) return res.status(404).send('user not found');
+
+    // تحديث شرطي للحالة يمنع دفع المكافأة مرتين لنفس الـ postback.
+    const claimed = await MonetagAttempt.findOneAndUpdate(
+      { _id: attempt._id, status: 'pending' },
+      { $set: { status: 'rewarded', rewardedAt: new Date() } },
+      { new: true }
+    );
+    if (!claimed) return res.status(200).send('duplicate');
+
+    // إضافة الذهب بعملية $inc ذرية بدل قراءة المستند ثم حفظه (كان يسبب ضياع تحديثات متزامنة).
+    let credited;
+    try {
+      credited = await User.findOneAndUpdate(
+        { telegramId: attempt.userId, isBanned: { $ne: true } },
+        { $inc: { gold: MONETAG_REWARD_GOLD } },
+        { new: true }
+      );
+    } catch (creditErr) {
+      // نعيد المحاولة إلى pending كي يستطيع Monetag إعادة إرسال الـ postback دون ضياع المكافأة.
+      await MonetagAttempt.updateOne(
+        { _id: claimed._id, status: 'rewarded' },
+        { $set: { status: 'pending', rewardedAt: null } }
+      ).catch((revertErr) => console.error('Monetag revert failed:', revertErr.message));
+      throw creditErr;
+    }
+    if (credited) {
+      await recordLedger({
+        userId: String(attempt.userId), type: 'monetag_reward', currency: 'gold', amount: MONETAG_REWARD_GOLD, balanceAfter: credited.gold,
+        refKey: `monetag:${claimed._id}`, description: 'مكافأة مشاهدة إعلان'
+      });
+    }
+    if (!credited) {
+      // الحساب محظور: لا مكافأة.
+      await MonetagAttempt.updateOne(
+        { _id: claimed._id, status: 'rewarded' },
+        { $set: { status: 'rejected', rewardedAt: null } }
+      );
+      return res.status(200).send('ignored');
+    }
+    return res.status(200).send('ok');
+  } catch (err) {
+    console.error('Monetag postback error:', err.message);
+    return res.status(500).send('retry');
   }
 });
 
@@ -1739,6 +2334,10 @@ async function createPaidTask(req, res, legacyRoute = false) {
   if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
     return res.status(400).json({ success: false, message: 'يسمح بروابط HTTP وHTTPS فقط' });
   }
+  // روابط بصيغة https://t.me@evil.com تُستخدم للتصيّد؛ نرفض أي رابط يحمل اسم مستخدم أو كلمة مرور.
+  if (parsedUrl.username || parsedUrl.password) {
+    return res.status(400).json({ success: false, message: 'رابط المهمة غير صالح' });
+  }
   // مهام قنوات/مجموعات تلغرام العامة يُتحقق منها فعليًا بـ getChatMember، لذا يجب أن يكون البوت مشرفًا فيها.
   // باقي الروابط (يوتيوب، إنستغرام، روابط دعوة خاصة...) تُقبل كما هي.
   const chat = extractTelegramChat(parsedUrl);
@@ -1773,6 +2372,10 @@ async function createPaidTask(req, res, legacyRoute = false) {
         link: chat ? chat.link : parsedUrl.href, target, cost: totalCost.toFixed(2), creatorId: userId
       }], { session });
       createdTask = docs[0];
+      await recordLedger({
+        userId, type: 'task_create', currency: 'balance', amount: -totalCost, balanceAfter: chargedUser.balance,
+        refKey: `task-create:${createdTask._id}`, description: `إنشاء مهمة: ${createdTask.title}`
+      }, { session });
     });
     return res.status(201).json({ success: true, message: 'تم إنشاء المهمة بنجاح', task: createdTask, chargedUsd: totalCost });
   } catch (err) {
@@ -1812,6 +2415,58 @@ app.post('/api/tasks/visit-ticket', userRequestAuth, async (req, res) => {
   }
 });
 
+// مواقع معروفة تُحوَّل مباشرة؛ أي موقع آخر يمر عبر صفحة تحذير حتى لا يُستغل نطاقك في التصيّد.
+const TRUSTED_TASK_HOSTS = [
+  't.me', 'telegram.me', 'telegram.dog', 'telegram.org',
+  'youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'facebook.com', 'fb.com', 'fb.me',
+  'x.com', 'twitter.com', 'discord.gg', 'discord.com', 'whatsapp.com', 'wa.me',
+  'snapchat.com', 'reddit.com', 'linkedin.com', 'twitch.tv'
+];
+
+function isTrustedTaskHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  return TRUSTED_TASK_HOSTS.some((trusted) => host === trusted || host.endsWith(`.${trusted}`));
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderExternalLinkWarning(destination) {
+  const safeHost = escapeHtml(destination.hostname);
+  const safeHref = escapeHtml(destination.href);
+  return `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>تنبيه قبل فتح الرابط</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Tahoma,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px;display:flex;justify-content:center}
+.card{max-width:480px;width:100%;background:#1e293b;border-radius:16px;padding:24px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+h1{font-size:20px;margin:0 0 12px}
+p{line-height:1.7;margin:8px 0}
+.host{direction:ltr;unicode-bidi:embed;background:#0f172a;border-radius:8px;padding:10px;word-break:break-all;font-family:monospace}
+a.btn{display:block;text-align:center;margin-top:18px;padding:12px;border-radius:10px;background:#f59e0b;color:#111827;text-decoration:none;font-weight:700}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>⚠️ أنت تغادر Money Slayer</h1>
+<p>هذا الرابط وضعه أحد المستخدمين ولم تراجعه المنصة. لا تُدخل كلمات مرور أو بيانات دفع أو رموز تحقق في الموقع التالي:</p>
+<p class="host">${safeHost}</p>
+<a class="btn" href="${safeHref}" rel="noopener noreferrer nofollow">أفهم المخاطر، تابع</a>
+</div>
+</body>
+</html>`;
+}
+
 app.get('/api/tasks/visit/redirect/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '');
@@ -1825,9 +2480,18 @@ app.get('/api/tasks/visit/redirect/:token', async (req, res) => {
     const task = await Task.findById(ticket.taskId).lean();
     if (!task) return res.status(410).send('المهمة لم تعد متاحة');
     const destination = new URL(task.link);
-    if (!['http:', 'https:'].includes(destination.protocol)) return res.status(410).send('رابط المهمة غير صالح');
+    if (!['http:', 'https:'].includes(destination.protocol) || destination.username || destination.password) {
+      return res.status(410).send('رابط المهمة غير صالح');
+    }
     res.set('Cache-Control', 'no-store');
-    return res.redirect(302, destination.href);
+    res.set('Referrer-Policy', 'no-referrer');
+    if (isTrustedTaskHost(destination.hostname)) {
+      return res.redirect(302, destination.href);
+    }
+    // موقع غير معروف: نعرض صفحة تحذير بدل تحويل مباشر من نطاقك الموثوق.
+    res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'");
+    res.set('X-Robots-Tag', 'noindex, nofollow');
+    return res.status(200).type('html').send(renderExternalLinkWarning(destination));
   } catch (err) {
     console.error('Visit redirect error:', err);
     return res.status(500).send('تعذر فتح رابط المهمة');
@@ -1946,7 +2610,12 @@ app.post('/api/tasks/complete', userRequestAuth, async (req, res) => {
         { telegramId: userId, isBanned: { $ne: true } }, { $inc: { gold: TASK_REWARD_GOLD } }, { new: true, session }
       );
       if (!updatedUser) { const e = new Error('تعذر تحديث رصيد المكافأة'); e.statusCode = 500; throw e; }
+      await recordLedger({
+        userId, type: 'task_reward', currency: 'gold', amount: TASK_REWARD_GOLD, balanceAfter: updatedUser.gold,
+        refKey: `task:${task._id}`, description: task.title || 'مهمة'
+      }, { session });
     });
+    // لا شرط مهام لمكافأة الإحالة حاليًا (REFERRAL_QUALIFY_TASKS = 0)، فلا حاجة لاستدعاء qualifyReferralIfEligible هنا.
     return res.json({
       success: true,
       rewardGold: TASK_REWARD_GOLD,
@@ -2084,8 +2753,8 @@ async function sendRocketState(req, res) {
     balance: user.gold,
     config: {
       lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE,
-      houseEdge: ROCKET_HOUSE_EDGE, maxMultiplier: ROCKET_MAX_MULTIPLIER, minBet: ROCKET_MIN_BET,
-      maxBet: ROCKET_MAX_BET, bettingSeconds: ROCKET_BETTING_SECONDS
+      houseEdge: rocketConfig.houseEdge, maxMultiplier: rocketConfig.maxMultiplier, minBet: rocketConfig.minBet,
+      maxBet: rocketConfig.maxBet, bettingSeconds: ROCKET_BETTING_SECONDS
     },
     round: payload.round,
     bets: payload.bets
@@ -2116,7 +2785,7 @@ app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
     const userId = req.telegramUser.id;
     const betAmount = Number(req.body.betAmount);
     const betSlot = Number(req.body.betSlot || 1);
-    if (!Number.isSafeInteger(betAmount) || betAmount < ROCKET_MIN_BET || betAmount > ROCKET_MAX_BET) {
+    if (!Number.isSafeInteger(betAmount) || betAmount < rocketConfig.minBet || betAmount > rocketConfig.maxBet) {
       return res.status(400).json({ success: false, message: 'مبلغ الرهان يجب أن يكون عددًا صحيحًا ضمن الحد المسموح' });
     }
     if (![1, 2].includes(betSlot)) {
@@ -2161,6 +2830,10 @@ app.post('/api/games/rocket/start', rocketAuth, async (req, res) => {
 
       bet = new RocketBet({ roundId: round.roundId, userId, betSlot, betAmount, status: 'active' });
       await bet.save({ session });
+      await recordLedger({
+        userId, type: 'rocket_bet', currency: 'gold', amount: -betAmount, balanceAfter: updatedUser.gold,
+        refKey: `bet:${bet._id}`, description: `رهان ${betAmount} ذهب`
+      }, { session });
     });
 
     const payload = await rocketRoundPayload(round, userId);
@@ -2233,6 +2906,10 @@ app.post('/api/games/rocket/cashout', rocketAuth, async (req, res) => {
       if (!updatedUser) {
         const e = new Error('حسابك غير موجود أو محظور؛ لم تُعتمد تسوية الرهان'); e.statusCode = 403; throw e;
       }
+      await recordLedger({
+        userId, type: 'rocket_win', currency: 'gold', amount: wonAmount, balanceAfter: updatedUser.gold,
+        refKey: `bet:${claimedBet._id}`, description: `سحب عند ${multiplier}x`
+      }, { session });
     });
 
     const payload = await rocketRoundPayload(round, userId);
@@ -2287,15 +2964,37 @@ app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
     const pendingTxs = await Transaction.find({ status: 'pending' }).sort({ createdAt: -1 });
     const promos = await Promo.find().sort({ createdAt: -1 });
 
+    // أرباح المنصة: كل عملة تُحتسب بمفردها دون خلط.
+    // الذهب = صافي رهانات الصاروخ + رسوم إنشاء الرموز الترويجية + رسوم التحويل من الذهب.
+    // الدولار = رسوم التحويل من العملات الأخرى (مسجلة بالدولار).
+    const [rocketNetGold, promoFeesGold, ledgerTotals] = await Promise.all([
+      RocketBet.aggregate([
+        { $group: { _id: null, wagered: { $sum: '$betAmount' }, paidOut: { $sum: '$wonAmount' } } },
+        { $project: { _id: 0, net: { $subtract: ['$wagered', '$paidOut'] } } }
+      ]).then((rows) => rows[0]?.net || 0),
+      PlatformFee.aggregate([
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]).then((rows) => rows[0]?.total || 0),
+      PlatformRevenue.aggregate([
+        { $group: { _id: '$currency', total: { $sum: '$amount' } } }
+      ])
+    ]);
+    const ledgerGold = ledgerTotals.find((row) => row._id === 'gold')?.total || 0;
+    const ledgerUsd = ledgerTotals.find((row) => row._id === 'usd')?.total || 0;
+    const totalRevenueGold = Math.round((rocketNetGold + promoFeesGold + ledgerGold) * 100) / 100;
+    const totalRevenueUsd = Math.round(ledgerUsd * 100) / 100;
+
     res.json({
       success: true,
       stats: {
         totalUsers,
         activeToday: Math.floor(totalUsers * 0.4),
-        totalRevenue: await RocketBet.aggregate([
-          { $group: { _id: null, wagered: { $sum: '$betAmount' }, paidOut: { $sum: '$wonAmount' } } },
-          { $project: { _id: 0, net: { $subtract: ['$wagered', '$paidOut'] } } }
-        ]).then((rows) => rows[0]?.net || 0),
+        totalRevenue: totalRevenueUsd,
+        totalRevenueGold,
+        revenueBreakdown: {
+          usd: { convertFees: totalRevenueUsd },
+          gold: { rocketNet: rocketNetGold, promoFees: promoFeesGold, convertFees: Math.round(ledgerGold * 100) / 100 }
+        },
         pendingCount: pendingTxs.length
       },
       transactions: pendingTxs.map((t) => ({
@@ -2319,15 +3018,368 @@ app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
         maxUses: p.maxUses,
         usedCount: p.usedCount
       })),
-      rocketConfig: {
-        lossRate: ROCKET_LOSS_RATE,
-        winRate: ROCKET_WIN_RATE,
-        houseEdge: ROCKET_HOUSE_EDGE,
-        maxMultiplier: ROCKET_MAX_MULTIPLIER
-      }
+      rocketConfig: publicRocketConfig()
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'خطأ في جلب بيانات لوحة التحكم' });
+  }
+});
+
+// قائمة المستخدمين للأدمن: الأرصدة والأرباح وكل النشاطات (آخر 100 نشاط لكل مستخدم).
+// تعريف الأرباح:
+// - أرباح الذهب = صافي الصاروخ (المكسوب - المراهَن، للرهانات المسوّاة) + مكافآت المهام + مكافآت الإعلانات + الرموز الترويجية بالذهب + مكافآت الإحالة المستلمة.
+// - أرباح الدولار = ما حُوّل إلى USDT + الرموز الترويجية بالدولار (التحويلات المسجلة بعد تفعيل سجل الإيرادات فقط).
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    if (String(req.query.adminId) !== ADMIN_ID) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+
+    const limit = Math.min(1000, Math.max(1, Number.parseInt(req.query.limit, 10) || 500));
+    const ACTIVITY_LIMIT_PER_USER = 100;
+    const FETCH_CAP = 5000;
+
+    const [totalUsers, users] = await Promise.all([
+      User.countDocuments(),
+      User.find().sort({ createdAt: -1 }).limit(limit).lean()
+    ]);
+
+    const ids = users.map((user) => String(user.telegramId));
+    if (!ids.length) {
+      return res.json({ success: true, total: totalUsers, users: [] });
+    }
+    const idSet = new Set(ids);
+
+    const [
+      transactions, bets, rocketAgg, tasksDone, taskCountAgg,
+      monetagRows, monetagAgg, promosUsed, promoAgg, createdPromos,
+      referredUsers, conversions, convertUsdAgg, ledgerRows
+    ] = await Promise.all([
+      Transaction.find({ userId: { $in: ids } }).sort({ createdAt: -1 }).limit(FETCH_CAP).lean(),
+      RocketBet.find({ userId: { $in: ids } }).sort({ createdAt: -1 }).limit(FETCH_CAP).lean(),
+      RocketBet.aggregate([
+        { $match: { userId: { $in: ids }, status: { $ne: 'active' } } },
+        { $group: { _id: '$userId', wagered: { $sum: '$betAmount' }, won: { $sum: '$wonAmount' } } }
+      ]),
+      Task.find({ completedBy: { $in: ids } }).select('title completedBy createdAt').limit(FETCH_CAP).lean(),
+      Task.aggregate([
+        { $match: { completedBy: { $in: ids } } },
+        { $unwind: '$completedBy' },
+        { $match: { completedBy: { $in: ids } } },
+        { $group: { _id: '$completedBy', count: { $sum: 1 } } }
+      ]),
+      MonetagAttempt.find({ userId: { $in: ids }, status: 'rewarded' }).sort({ rewardedAt: -1 }).limit(FETCH_CAP).lean(),
+      MonetagAttempt.aggregate([
+        { $match: { userId: { $in: ids }, status: 'rewarded' } },
+        { $group: { _id: '$userId', count: { $sum: 1 } } }
+      ]),
+      Promo.find({ usedBy: { $in: ids } }).select('code amount type usedBy').limit(FETCH_CAP).lean(),
+      Promo.aggregate([
+        { $match: { usedBy: { $in: ids } } },
+        { $unwind: '$usedBy' },
+        { $match: { usedBy: { $in: ids } } },
+        { $group: { _id: { userId: '$usedBy', type: '$type' }, total: { $sum: '$amount' } } }
+      ]),
+      Promo.find({ creatorId: { $in: ids }, fundingStatus: 'funded' })
+        .select('code creatorId fundedAmount feeAmount createdAt').sort({ createdAt: -1 }).limit(FETCH_CAP).lean(),
+      User.find({ referredBy: { $in: ids } })
+        .select('telegramId name referredBy referralQualified createdAt').sort({ createdAt: -1 }).limit(FETCH_CAP).lean(),
+      PlatformRevenue.find({ userId: { $in: ids }, source: 'convert_fee' }).sort({ createdAt: -1 }).limit(FETCH_CAP).lean(),
+      PlatformRevenue.aggregate([
+        { $match: { userId: { $in: ids }, source: 'convert_fee', to: 'USDT' } },
+        { $group: { _id: '$userId', received: { $sum: '$receivedAmount' } } }
+      ]),
+      LedgerEntry.find({ userId: { $in: ids } }).sort({ createdAt: -1 }).limit(FETCH_CAP).lean()
+    ]);
+
+    // ---- مجاميع الأرباح لكل مستخدم ----
+    const rocketNetByUser = new Map(rocketAgg.map((row) => [row._id, (Number(row.won) || 0) - (Number(row.wagered) || 0)]));
+    const taskCountByUser = new Map(taskCountAgg.map((row) => [row._id, Number(row.count) || 0]));
+    const monetagCountByUser = new Map(monetagAgg.map((row) => [row._id, Number(row.count) || 0]));
+    const promoGoldByUser = new Map();
+    const promoUsdByUser = new Map();
+    for (const row of promoAgg) {
+      const type = row._id.type || 'gold';
+      if (type === 'gold') promoGoldByUser.set(row._id.userId, Number(row.total) || 0);
+      else if (type === 'balance') promoUsdByUser.set(row._id.userId, Number(row.total) || 0);
+    }
+    const convertedUsdtByUser = new Map(convertUsdAgg.map((row) => [row._id, Number(row.received) || 0]));
+
+    // ---- النشاطات ----
+    const activitiesByUser = new Map();
+    const pushActivity = (userId, activity) => {
+      if (!idSet.has(userId)) return;
+      if (!activitiesByUser.has(userId)) activitiesByUser.set(userId, []);
+      activitiesByUser.get(userId).push(activity);
+    };
+
+    for (const tx of transactions) {
+      pushActivity(String(tx.userId), {
+        id: `tx-${tx.txId}`,
+        type: tx.type === 'إيداع' ? 'deposit' : tx.type === 'سحب' ? 'withdraw' : String(tx.type || ''),
+        amount: tx.amount,
+        currency: 'balance',
+        description: [tx.method, tx.details].filter(Boolean).join(' - ').slice(0, 200),
+        status: tx.status,
+        createdAt: tx.createdAt
+      });
+    }
+
+    for (const bet of bets) {
+      const won = bet.status === 'cashed_out';
+      const lost = bet.status === 'lost';
+      pushActivity(String(bet.userId), {
+        id: `bet-${bet._id}`,
+        type: 'rocket',
+        amount: won ? (Number(bet.wonAmount) || 0) - (Number(bet.betAmount) || 0) : lost ? -(Number(bet.betAmount) || 0) : null,
+        currency: 'gold',
+        description: `رهان ${bet.betAmount} ذهب${won && bet.cashOutMultiplier ? ` - سحب عند ${bet.cashOutMultiplier}x` : ''}`,
+        status: won ? 'ربح' : lost ? 'خسارة' : 'جارٍ',
+        createdAt: bet.createdAt
+      });
+    }
+
+    for (const task of tasksDone) {
+      for (const completedId of (task.completedBy || []).map(String)) {
+        pushActivity(completedId, {
+          id: `task-${task._id}-${completedId}`,
+          type: 'task',
+          amount: TASK_REWARD_GOLD,
+          currency: 'gold',
+          description: task.title || 'مهمة',
+          status: '',
+          createdAt: null
+        });
+      }
+    }
+
+    for (const attempt of monetagRows) {
+      pushActivity(String(attempt.userId), {
+        id: `monetag-${attempt._id}`,
+        type: 'bonus',
+        amount: MONETAG_REWARD_GOLD,
+        currency: 'gold',
+        description: 'مكافأة مشاهدة إعلان',
+        status: '',
+        createdAt: attempt.rewardedAt || attempt.createdAt
+      });
+    }
+
+    for (const promo of promosUsed) {
+      for (const usedId of (promo.usedBy || []).map(String)) {
+        const promoType = promo.type || 'gold';
+        pushActivity(usedId, {
+          id: `promo-use-${promo._id}-${usedId}`,
+          type: 'promo',
+          amount: promoType === 'gold' || promoType === 'balance' ? promo.amount : null,
+          currency: promoType === 'balance' ? 'balance' : 'gold',
+          description: `تفعيل الرمز ${promo.code}${promoType === 'diamonds' ? ` (${promo.amount} GRAM)` : ''}`,
+          status: '',
+          createdAt: null
+        });
+      }
+    }
+
+    for (const promo of createdPromos) {
+      pushActivity(String(promo.creatorId), {
+        id: `promo-create-${promo._id}`,
+        type: 'promo',
+        amount: -((Number(promo.fundedAmount) || 0) + (Number(promo.feeAmount) || 0)),
+        currency: 'gold',
+        description: `إنشاء الرمز ${promo.code} (رسوم المنصة ${promo.feeAmount || 0} ذهب)`,
+        status: '',
+        createdAt: promo.createdAt
+      });
+    }
+
+    for (const friend of referredUsers) {
+      pushActivity(String(friend.referredBy), {
+        id: `ref-${friend.telegramId}`,
+        type: 'referral',
+        // قيمة المكافأة تظهر عند استلامها كقيد في السجل المالي (referral_claim)، فلا نكررها هنا.
+        amount: null,
+        currency: 'gold',
+        description: `إحالة صديق: ${friend.name || friend.telegramId}`,
+        status: '',
+        createdAt: friend.createdAt
+      });
+    }
+
+    for (const conversion of conversions) {
+      pushActivity(String(conversion.userId), {
+        id: `convert-${conversion._id}`,
+        type: 'convert',
+        amount: null,
+        currency: conversion.from === 'GOLD' ? 'gold' : 'balance',
+        description: `تحويل ${conversion.sourceAmount} ${conversion.from} إلى ${conversion.receivedAmount} ${conversion.to}`,
+        status: '',
+        createdAt: conversion.createdAt
+      });
+    }
+
+    // دمج السجل المالي: القيود الجديدة (بتاريخ دقيق) تحل محل النشاطات القديمة المشتقة لنفس العملية.
+    // قيود الإيداع/السحب (tx:) تبقى في السجل للتدقيق لكن لا تُعرض هنا لأن صف المعاملة الأصلي يعرض حالتها.
+    const legacyRefKey = (activityId) => {
+      const text = String(activityId || '');
+      let match = /^bet-(.+)$/.exec(text);
+      if (match) return `bet:${match[1]}`;
+      match = /^task-([^-]+)-.+$/.exec(text);
+      if (match) return `task:${match[1]}`;
+      match = /^monetag-(.+)$/.exec(text);
+      if (match) return `monetag:${match[1]}`;
+      match = /^promo-use-([^-]+)-.+$/.exec(text);
+      if (match) return `promo-use:${match[1]}`;
+      match = /^promo-create-(.+)$/.exec(text);
+      if (match) return `promo-create:${match[1]}`;
+      match = /^convert-(.+)$/.exec(text);
+      if (match) return `convert:${match[1]}`;
+      return null;
+    };
+    const ledgerKeysByUser = new Map();
+    const ledgerActivitiesByUser = new Map();
+    for (const entry of ledgerRows) {
+      const entryUserId = String(entry.userId);
+      if (!ledgerKeysByUser.has(entryUserId)) ledgerKeysByUser.set(entryUserId, new Set());
+      if (entry.refKey) ledgerKeysByUser.get(entryUserId).add(entry.refKey);
+      if (entry.refKey && entry.refKey.startsWith('tx:')) continue;
+      if (!ledgerActivitiesByUser.has(entryUserId)) ledgerActivitiesByUser.set(entryUserId, []);
+      ledgerActivitiesByUser.get(entryUserId).push({
+        id: `ledger-${entry._id}`,
+        type: entry.type,
+        amount: entry.amount,
+        currency: entry.currency,
+        description: entry.description || '',
+        status: '',
+        createdAt: entry.createdAt
+      });
+    }
+
+    const timeOf = (value) => (value ? new Date(value).getTime() || 0 : 0);
+
+    res.json({
+      success: true,
+      total: totalUsers,
+      users: users.map((user) => {
+        const id = String(user.telegramId);
+        const coveredKeys = ledgerKeysByUser.get(id) || new Set();
+        const legacyActivities = (activitiesByUser.get(id) || []).filter((activity) => {
+          const key = legacyRefKey(activity.id);
+          return !(key && coveredKeys.has(key));
+        });
+        const activities = [...legacyActivities, ...(ledgerActivitiesByUser.get(id) || [])]
+          .sort((a, b) => timeOf(b.createdAt) - timeOf(a.createdAt))
+          .slice(0, ACTIVITY_LIMIT_PER_USER)
+          .map((activity) => ({
+            ...activity,
+            createdAt: activity.createdAt ? new Date(activity.createdAt).toISOString() : null
+          }));
+
+        const profitGold =
+          (rocketNetByUser.get(id) || 0) +
+          (taskCountByUser.get(id) || 0) * TASK_REWARD_GOLD +
+          (monetagCountByUser.get(id) || 0) * MONETAG_REWARD_GOLD +
+          (promoGoldByUser.get(id) || 0) +
+          Math.max(0, Number(user.totalReferralGold) || 0);
+        const profitUsd = (convertedUsdtByUser.get(id) || 0) + (promoUsdByUser.get(id) || 0);
+
+        return {
+          id,
+          name: user.name || '',
+          username: '',
+          balance: Number(user.balance) || 0,
+          gold: Number(user.gold) || 0,
+          totalProfit: Math.round(profitUsd * 100) / 100,
+          totalProfitGold: Math.round(profitGold),
+          isBanned: Boolean(user.isBanned),
+          createdAt: user.createdAt || null,
+          lastActive: user.lastActiveAt || null,
+          activities
+        };
+      })
+    });
+  } catch (err) {
+    console.error('admin users error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب بيانات المستخدمين' });
+  }
+});
+
+// السجل المالي الموحّد: قائمة القيود مع فلاتر وملخص مجاميع لكل (نوع، عملة).
+app.get('/api/admin/ledger', adminAuth, async (req, res) => {
+  try {
+    if (String(req.query.adminId) !== ADMIN_ID) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+    const baseFilter = {};
+    if (req.query.userId) baseFilter.userId = String(req.query.userId).trim();
+    if (req.query.type) baseFilter.type = String(req.query.type).trim();
+    if (req.query.currency) baseFilter.currency = String(req.query.currency).trim();
+
+    const pageFilter = { ...baseFilter };
+    if (req.query.before) {
+      const beforeDate = new Date(String(req.query.before));
+      if (!Number.isNaN(beforeDate.getTime())) pageFilter.createdAt = { $lt: beforeDate };
+    }
+
+    const [rows, total, summary] = await Promise.all([
+      LedgerEntry.find(pageFilter).sort({ createdAt: -1 }).limit(limit + 1).lean(),
+      LedgerEntry.countDocuments(baseFilter),
+      LedgerEntry.aggregate([
+        { $match: baseFilter },
+        { $group: { _id: { type: '$type', currency: '$currency' }, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+        { $sort: { '_id.type': 1, '_id.currency': 1 } }
+      ])
+    ]);
+
+    const hasMore = rows.length > limit;
+    const entries = rows.slice(0, limit);
+    res.json({
+      success: true,
+      total,
+      hasMore,
+      nextBefore: hasMore && entries.length ? new Date(entries[entries.length - 1].createdAt).toISOString() : null,
+      entries: entries.map((entry) => ({
+        id: String(entry._id),
+        userId: entry.userId,
+        type: entry.type,
+        currency: entry.currency,
+        amount: entry.amount,
+        balanceAfter: entry.balanceAfter,
+        description: entry.description || '',
+        refKey: entry.refKey || null,
+        createdAt: entry.createdAt ? new Date(entry.createdAt).toISOString() : null
+      })),
+      summary: summary.map((row) => ({ type: row._id.type, currency: row._id.currency, total: row.total, count: row.count }))
+    });
+  } catch (err) {
+    console.error('admin ledger error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب السجل المالي' });
+  }
+});
+
+// سجل تدقيق إجراءات الأدمن (آخر العمليات الحساسة).
+app.get('/api/admin/audit', adminAuth, async (req, res) => {
+  try {
+    if (String(req.query.adminId) !== ADMIN_ID) {
+      return res.status(403).json({ success: false, message: 'غير مصرح لك بالوصول' });
+    }
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 100));
+    const rows = await AdminAudit.find().sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({
+      success: true,
+      entries: rows.map((row) => ({
+        id: String(row._id),
+        adminId: row.adminId,
+        action: row.action,
+        target: row.target,
+        details: row.details,
+        createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : null
+      }))
+    });
+  } catch (err) {
+    console.error('admin audit error:', err);
+    res.status(500).json({ success: false, message: 'تعذر جلب سجل التدقيق' });
   }
 });
 
@@ -2365,6 +3417,10 @@ app.post('/api/admin/process-transaction', adminAuth, async (req, res) => {
           e.statusCode = 404;
           throw e;
         }
+        await recordLedger({
+          userId: String(tx.userId), type: action === 'accept' ? 'deposit' : 'withdraw_refund', currency: 'balance', amount: delta,
+          refKey: `tx:${tx.txId}`, description: action === 'accept' ? 'قبول إيداع' : 'رفض سحب واسترجاع المبلغ'
+        }, { session });
       }
 
       const updatedTx = await Transaction.findOneAndUpdate(
@@ -2380,6 +3436,7 @@ app.post('/api/admin/process-transaction', adminAuth, async (req, res) => {
       processedType = tx.type;
     });
 
+    await recordAdminAudit(req.telegramUser.id, 'process_transaction', txId, { action, type: processedType });
     return res.json({ success: true, message: `تم ${action === 'accept' ? 'قبول' : 'رفض'} المعاملة بنجاح`, type: processedType });
   } catch (err) {
     if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
@@ -2415,7 +3472,7 @@ app.get('/api/admin/rocket', adminAuth, async (req, res) => {
     const statsByRound = new Map(betStats.map((item) => [item._id, item]));
     res.json({
       success: true,
-      config: { lossRate: ROCKET_LOSS_RATE, winRate: ROCKET_WIN_RATE, houseEdge: ROCKET_HOUSE_EDGE, maxMultiplier: ROCKET_MAX_MULTIPLIER, growthRate: ROCKET_GROWTH_RATE },
+      config: { ...publicRocketConfig(), growthRate: ROCKET_GROWTH_RATE },
       activeRound: activeRound ? {
         roundId: activeRound.roundId, status: activeRound.status,
         bettingEndsAt: activeRound.bettingEndsAt, startedAt: activeRound.startedAt,
@@ -2445,24 +3502,36 @@ app.post('/api/admin/update-rocket', adminAuth, async (req, res) => {
     if (String(req.body.adminId) !== ADMIN_ID) {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
-    const requestedKeys = ['lossRate', 'winRate', 'maxMultiplier'];
-    const hasChanges = requestedKeys.some((key) => req.body[key] !== undefined);
-    const config = {
-      lossRate: ROCKET_LOSS_RATE,
-      winRate: ROCKET_WIN_RATE,
-      houseEdge: ROCKET_HOUSE_EDGE,
-      maxMultiplier: ROCKET_MAX_MULTIPLIER
-    };
-    if (hasChanges) {
-      return res.status(400).json({
-        success: false,
-        message: 'تعديل إعدادات الصاروخ غير مدعوم حاليًا لأن الإعدادات ليست مخزنة في قاعدة البيانات. لم يتم حفظ أي تغيير.',
-        config
-      });
+
+    // lossRate و winRate حقلان قديمان مشتقان ولا يُعدَّلان؛ المتحكم الفعلي هو هامش المنصة (houseEdgePercent).
+    const parsed = parseRocketSettingsInput(req.body);
+    if (parsed.error) {
+      return res.status(400).json({ success: false, message: parsed.error, config: publicRocketConfig() });
     }
-    return res.json({ success: true, message: 'هذه هي الإعدادات الحالية؛ لم يتم إجراء أي تعديل.', config });
+    if (!parsed.changed) {
+      return res.json({ success: true, message: 'لم يتم إرسال أي تغيير؛ هذه هي الإعدادات الحالية.', config: publicRocketConfig() });
+    }
+
+    const before = publicRocketConfig();
+    const now = new Date();
+    const saved = await RocketSettings.findOneAndUpdate(
+      { key: 'rocket' },
+      { $set: { ...parsed.values, updatedBy: String(req.telegramUser.id), updatedAt: now } },
+      { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
+    ).lean();
+    applyRocketConfig(saved);
+
+    const after = publicRocketConfig();
+    await recordAdminAudit(req.telegramUser.id, 'rocket_settings_update', 'rocket', { before, after });
+
+    return res.json({
+      success: true,
+      message: 'تم حفظ إعدادات الصاروخ في قاعدة البيانات، وتسري على الجولات القادمة (الجولة الحالية لا تتغير).',
+      config: after
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'خطأ' });
+    console.error('update rocket settings error:', err);
+    res.status(500).json({ success: false, message: 'تعذر حفظ إعدادات الصاروخ' });
   }
 });
 
@@ -2479,6 +3548,7 @@ app.post('/api/admin/user-ban', adminAuth, async (req, res) => {
 
     user.isBanned = action === 'ban';
     await user.save();
+    await recordAdminAudit(adminId, action === 'ban' ? 'ban_user' : 'unban_user', targetUserId, null);
 
     res.json({
       success: true,
@@ -2527,6 +3597,11 @@ app.post('/api/admin/modify-balance', adminAuth, async (req, res) => {
       }
     }
 
+    await recordLedger({
+      userId: String(targetUserId), type: 'admin_adjust', currency: balanceType, amount: action === 'add' ? value : -value,
+      balanceAfter: user[balanceType], refKey: `admin:${Date.now()}`, description: 'تعديل من الإدارة', meta: { adminId: String(adminId) }
+    });
+    await recordAdminAudit(adminId, 'modify_balance', targetUserId, { action, currency: balanceType, amount: value });
     return res.json({ success: true, message: 'تم تعديل الرصيد بنجاح', user: publicUser(user) });
   } catch (err) {
     console.error('admin modify balance error:', err);
@@ -2668,6 +3743,25 @@ async function handleTelegramStartUpdate(update) {
   const text = message && typeof message.text === 'string' ? message.text.trim() : '';
   if (!message || !message.chat || !/^\/start(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(text)) return;
 
+  // رابط الإحالة عبر البوت: t.me/<bot>?start=ref_<id>. نحفظ الربط باستخدام message.from.id الموثوق.
+  const payloadMatch = /^\/start(?:@[A-Za-z0-9_]+)?\s+(\S+)/i.exec(text);
+  const referrerId = payloadMatch ? parseReferralParam(payloadMatch[1]) : null;
+  const fromId = message.from && message.from.id != null ? String(message.from.id) : null;
+  if (referrerId && fromId && fromId !== referrerId && mongoose.connection.readyState === 1) {
+    try {
+      const alreadyUser = await User.exists({ telegramId: fromId });
+      if (!alreadyUser) {
+        await PendingReferral.findOneAndUpdate(
+          { telegramId: fromId },
+          { $set: { referrerId, expiresAt: new Date(Date.now() + PENDING_REFERRAL_TTL_MS) } },
+          { upsert: true }
+        );
+      }
+    } catch (pendingErr) {
+      console.error('pending referral save error:', pendingErr.message);
+    }
+  }
+
   const result = await telegramBotApi('sendMessage', {
     chat_id: String(message.chat.id),
     text: START_BOT_TEXT,
@@ -2684,6 +3778,12 @@ async function startTelegramStartPolling() {
   if (telegramPollingStarted || !TELEGRAM_BOT_TOKEN) return;
   telegramPollingStarted = true;
   console.log('🤖 تم تفعيل معالج /start لبوت Telegram عبر long polling');
+  // وجود webhook مفعّل يمنع getUpdates تمامًا؛ نزيله دون حذف التحديثات المعلّقة.
+  try {
+    await telegramBotApi('deleteWebhook', { drop_pending_updates: 'false' });
+  } catch (hookErr) {
+    console.error('deleteWebhook error:', hookErr.message);
+  }
   while (true) {
     try {
       const updates = await telegramLongPollGetUpdates(telegramUpdateOffset);
