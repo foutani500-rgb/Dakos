@@ -86,7 +86,8 @@ async function ensureIndexes(db) {
       db.collection('users').createIndex({ referralCode: 1 }, { unique: true, sparse: true }),
       db.collection('users').createIndex({ createdAt: -1 }),
       db.collection('episodes').createIndex({ seriesId: 1, episode: 1 }, { unique: true }),
-      db.collection('stories').createIndex({ seriesId: 1 })
+      db.collection('stories').createIndex({ seriesId: 1 }),
+      db.collection('ratelimit').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 })
     ]);
   } catch (e) { console.error('index error', e.message); }
 }
@@ -98,7 +99,7 @@ async function getSettings(db) {
 }
 const publicConfig = (s) => ({
   price: s.price, dailyGold: s.dailyGold, channelGold: s.channelGold, referralGold: s.referralGold,
-  botUsername: env('BOT_USERNAME').replace(/^@/, ''), miniAppName: env('MINI_APP_NAME'), channel: s.channel
+  botUsername: env('BOT_USERNAME', 'dakoslayer_bot').replace(/^@/, ''), miniAppName: env('MINI_APP_NAME'), channel: s.channel
 });
 
 /* ============================== هوية المستخدم (Telegram) ============================== */
@@ -177,6 +178,24 @@ const adminAuth = (req, res, next) => {
   } catch (e) { next(e); }
 };
 
+/**
+ * عدّاد محاولات الدخول: تحديث ذرّي واحد (زيادة + إعادة ضبط النافذة) يسبق فحص كلمة السر.
+ * لذلك لا يمكن لطلبات متزامنة تجاوز الحد: كل طلب يأخذ رقمًا فريدًا، ومن رقمه أكبر من الحد يُرفض قبل أي فحص.
+ */
+async function loginAttempt(rl, ip) {
+  const now = Date.now();
+  const run = () => rl.findOneAndUpdate({ _id: ip }, [
+    { $set: { _live: { $gt: [{ $ifNull: ['$resetAt', 0] }, now] } } },
+    { $set: {
+      count: { $add: [{ $cond: ['$_live', { $ifNull: ['$count', 0] }, 0] }, 1] },
+      resetAt: { $cond: ['$_live', '$resetAt', now + LOGIN_WINDOW] }
+    } },
+    { $set: { expireAt: { $toDate: '$resetAt' } } },
+    { $unset: '_live' }
+  ], { upsert: true, returnDocument: 'after' });
+  try { return await run(); } catch (e) { if (e && e.code === 11000) return run(); throw e; }   // سباق إنشاء أول سجل
+}
+
 /* ============================== مساعدات البيانات ============================== */
 const userName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || u.username || String(u._id);
 const publicUser = (u) => ({ id: u._id, first_name: u.first_name || '', username: u.username || '', language_code: u.language_code || '', photo_url: u.photo_url || '' });
@@ -229,6 +248,63 @@ async function assertChannelMember(channel, userId) {
   fail(403, 'not_member');
 }
 
+/* ============================== التسجيل والإحالة (مشترك بين التطبيق والبوت) ============================== */
+const tgFields = (tg) => ({
+  first_name: clean(tg.first_name, 100), last_name: clean(tg.last_name, 100), username: clean(tg.username, 64),
+  language_code: clean(tg.language_code, 10), photo_url: clean(tg.photo_url, 500)
+});
+const REF_CODE_RE = /^[A-Za-z0-9_-]{4,40}$/;
+
+/**
+ * ينشئ الحساب مرة واحدة فقط (upsert ذرّي)، وعند الإنشاء الفعلي فقط تُحتسب الإحالة لصاحب الرابط.
+ * لذلك لا تتكرر المكافأة مهما تكرر الضغط على Start أو فتح التطبيق، ولا تُحتسب لحساب قديم.
+ */
+async function registerAccount(db, tg, settings, startCode) {
+  const users = db.collection('users');
+  const now = Date.now();
+  const welcome = settings.welcomeGold;
+  const r = await users.updateOne({ _id: tg.id }, {
+    $setOnInsert: {
+      ...tgFields(tg), gold: welcome, friends: 0, referralGold: 0, referralCode: newCode(), unlocked: {}, views: 0, unlockCount: 0,
+      banned: false, createdAt: now, lastSeen: now, history: welcome > 0 ? [{ type: 'welcome', amount: welcome, at: now }] : []
+    }
+  }, { upsert: true });
+  const created = r.upsertedCount > 0;
+  let inviter = null;
+  if (created && REF_CODE_RE.test(startCode || '')) {
+    const found = await users.findOne({ referralCode: startCode, banned: { $ne: true } });
+    if (found && found._id !== tg.id) {
+      await users.updateOne({ _id: found._id }, {
+        $inc: { gold: settings.referralGold, friends: 1, referralGold: settings.referralGold },
+        $push: { history: pushHistory({ type: 'referral', amount: settings.referralGold }) }
+      });
+      await users.updateOne({ _id: tg.id }, { $set: { referredBy: found._id } });
+      inviter = found;
+    }
+  }
+  return { created, inviter };
+}
+
+/* ============================== رسائل البوت ============================== */
+const BOT_TEXT = {
+  ar: { hello: (n) => `أهلاً ${n} 👋\nاضغط الزر لفتح DAKOS SLAYER وشاهد أحدث المسلسلات.`, open: 'فتح التطبيق 🎬', joined: (g) => `🎉 انضم صديق جديد عبر رابطك وحصلت على ${g} ذهب.` },
+  en: { hello: (n) => `Welcome ${n} 👋\nTap the button to open DAKOS SLAYER and watch the latest series.`, open: 'Open the app 🎬', joined: (g) => `🎉 A new friend joined through your link — you earned ${g} gold.` },
+  fr: { hello: (n) => `Bienvenue ${n} 👋\nAppuyez sur le bouton pour ouvrir DAKOS SLAYER.`, open: 'Ouvrir l’app 🎬', joined: (g) => `🎉 Un nouvel ami a rejoint via votre lien — vous gagnez ${g} or.` }
+};
+const botLang = (code) => { const c = String(code || '').slice(0, 2).toLowerCase(); return BOT_TEXT[c] ? c : 'ar'; };
+async function botSend(chatId, text, buttonText) {
+  const token = env('BOT_TOKEN');
+  if (!token) return;
+  const body = { chat_id: chatId, text };
+  const web = env('FRONTEND_URL');
+  if (buttonText && /^https:\/\//i.test(web)) body.reply_markup = { inline_keyboard: [[{ text: buttonText, web_app: { url: web } }]] };
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(6000)
+    });
+  } catch { /* الرسالة اختيارية؛ لا تُفشل التسجيل */ }
+}
+
 /* ============================== التطبيق ============================== */
 const app = express();
 app.disable('x-powered-by');
@@ -253,7 +329,7 @@ app.get('/', (req, res) => res.json({ name: 'dakos-server', ok: true }));
 /* ---------- فحص الحالة (بديل /.netlify/functions/health) ---------- */
 app.get('/api/health', h(async (req, res) => {
   const checks = {
-    mongodb_uri: !!env('MONGODB_URI'), bot_token: !!env('BOT_TOKEN'), bot_username: !!env('BOT_USERNAME'),
+    mongodb_uri: !!env('MONGODB_URI'), bot_token: !!env('BOT_TOKEN'), bot_username: !!env('BOT_USERNAME', 'dakoslayer_bot'),
     admin_email: !!env('ADMIN_EMAIL'), admin_password: !!(env('ADMIN_PASSWORD_HASH') || env('ADMIN_PASSWORD')),
     admin_secret: env('ADMIN_SECRET').length >= 16
   };
@@ -289,38 +365,16 @@ app.get('/api/user/profile', userAuth, h(async (req, res) => {
   const users = db.collection('users');
   const settings = await getSettings(db);
   const tg = req.tg;
-  const now = Date.now();
-  const fields = {
-    first_name: clean(tg.first_name, 100), last_name: clean(tg.last_name, 100), username: clean(tg.username, 64),
-    language_code: clean(tg.language_code, 10), photo_url: clean(tg.photo_url, 500)
-  };
   const existing = await users.findOne({ _id: tg.id });
   if (existing && existing.banned) fail(403, 'banned');
 
   let doc;
   if (existing) {
-    doc = await users.findOneAndUpdate({ _id: tg.id }, { $set: { ...fields, lastSeen: now } }, { returnDocument: 'after' });
+    doc = await users.findOneAndUpdate({ _id: tg.id }, { $set: { ...tgFields(tg), lastSeen: Date.now() } }, { returnDocument: 'after' });
   } else {
-    const welcome = settings.welcomeGold;
-    const r = await users.updateOne({ _id: tg.id }, {
-      $setOnInsert: {
-        ...fields, gold: welcome, friends: 0, referralGold: 0, referralCode: newCode(), unlocked: {}, views: 0, unlockCount: 0,
-        banned: false, createdAt: now, lastSeen: now, history: welcome > 0 ? [{ type: 'welcome', amount: welcome, at: now }] : []
-      }
-    }, { upsert: true });
+    // دخول مباشر للتطبيق (startapp): نفس منطق التسجيل والإحالة المستخدم في البوت
+    await registerAccount(db, tg, settings, req.startParam);
     doc = await users.findOne({ _id: tg.id });
-    // مكافأة الإحالة: لمن دعا هذا المستخدم الجديد (مرة واحدة فقط عند إنشاء الحساب)
-    const code = /^[A-Za-z0-9_-]{4,40}$/.test(req.startParam) ? req.startParam : '';
-    if (r.upsertedCount && code) {
-      const inviter = await users.findOne({ referralCode: code, banned: { $ne: true } });
-      if (inviter && inviter._id !== tg.id) {
-        await users.updateOne({ _id: inviter._id }, {
-          $inc: { gold: settings.referralGold, friends: 1, referralGold: settings.referralGold },
-          $push: { history: pushHistory({ type: 'referral', amount: settings.referralGold }) }
-        });
-        await users.updateOne({ _id: tg.id }, { $set: { referredBy: inviter._id } });
-      }
-    }
   }
   res.json({ user: publicUser(doc), profile: profileOf(doc), config: publicConfig(settings) });
 }));
@@ -399,29 +453,54 @@ app.post('/api/tasks/claim', userAuth, h(async (req, res) => {
 }));
 
 /* ======================================================================
+   بوت Telegram (Webhook): عند ضغط Start من رابط الإحالة  t.me/BOT?start=CODE
+   ====================================================================== */
+app.post('/api/telegram/webhook', h(async (req, res) => {
+  const secret = env('TELEGRAM_WEBHOOK_SECRET');
+  if (!secret) fail(500, 'config', 'TELEGRAM_WEBHOOK_SECRET غير مضبوط');
+  // ترويسة Telegram الرسمية، تُرسَل مع كل تحديث إن مرّرت secret_token في setWebhook
+  if (!safeEqHex(req.get('x-telegram-bot-api-secret-token') || '', secret)) fail(403, 'bad_session', 'ترويسة Telegram غير صحيحة');
+
+  const msg = req.body && req.body.message;
+  const from = msg && msg.from;
+  const m = msg && typeof msg.text === 'string' ? /^\/start(?:@\w+)?(?:\s+(\S+))?$/.exec(msg.text.trim()) : null;
+  if (!m || !from || from.is_bot || !Number.isSafeInteger(from.id) || !msg.chat || msg.chat.type !== 'private') return res.json({ ok: true });
+
+  const db = await getDb();
+  const settings = await getSettings(db);
+  const existing = await db.collection('users').findOne({ _id: from.id }, { projection: { banned: 1 } });
+  if (existing && existing.banned) return res.json({ ok: true });
+
+  const reg = existing ? { created: false, inviter: null } : await registerAccount(db, from, settings, m[1] || '');
+  const t = BOT_TEXT[botLang(from.language_code)];
+  const sends = [botSend(from.id, t.hello(clean(from.first_name, 60) || ''), t.open)];
+  if (reg.inviter) sends.push(botSend(reg.inviter._id, BOT_TEXT[botLang(reg.inviter.language_code)].joined(settings.referralGold)));
+  await Promise.allSettled(sends);
+  res.json({ ok: true });
+}));
+
+/* ======================================================================
    المشرف
    ====================================================================== */
 app.post('/api/admin/login', h(async (req, res) => {
   const db = await getDb();
   const rl = db.collection('ratelimit');
-  const ip = clientIp(req);
-  const now = Date.now();
-  const rec = await rl.findOne({ _id: ip });
-  if (rec && rec.resetAt > now && rec.count >= LOGIN_MAX_TRIES) fail(429, 'rate_limited');
-
   const email = env('ADMIN_EMAIL').toLowerCase();
   if (!email) fail(500, 'config', 'ADMIN_EMAIL غير مضبوط');
+
+  // 1) تُحتسب المحاولة ذريًا قبل أي فحص؛ ما زاد عن الحد يُرفض دون فحص كلمة السر
+  const ip = clientIp(req);
+  const attempt = await loginAttempt(rl, ip);
+  if (attempt.count > LOGIN_MAX_TRIES) fail(429, 'rate_limited');
+
+  // 2) تُنفَّذ المقارنتان دائمًا (زمن ثابت) حتى لا يُكشف أيهما الخاطئ
   const username = clean(req.body && req.body.username, 200).toLowerCase();
   const password = clean(req.body && req.body.password, 200);
-  // تُنفَّذ المقارنتان دائمًا (زمن ثابت) حتى لا يُكشف أيهما الخاطئ
   const emailOk = crypto.timingSafeEqual(sha(username), sha(email));
   const passOk = verifyPassword(password);
-  if (!(emailOk && passOk)) {
-    if (!rec || rec.resetAt <= now) await rl.updateOne({ _id: ip }, { $set: { count: 1, resetAt: now + LOGIN_WINDOW } }, { upsert: true });
-    else await rl.updateOne({ _id: ip }, { $inc: { count: 1 } });
-    fail(401, 'admin_auth');
-  }
-  await rl.deleteOne({ _id: ip });
+  if (!(emailOk && passOk)) fail(401, 'admin_auth');
+
+  await rl.deleteOne({ _id: ip });                       // نجاح الدخول يصفّر العدّاد
   res.json({ token: signAdmin(), expiresIn: ADMIN_TTL_SEC });
 }));
 
