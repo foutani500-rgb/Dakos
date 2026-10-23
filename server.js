@@ -37,8 +37,8 @@ const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(
 /* ====== القيم المضمّنة (تُستخدم فقط إن لم يُضبط المتغير في Vercel؛ متغيرات Vercel لها الأولوية) ======
  * عبّئ BOT_TOKEN و MONGODB_URI بين علامتي الاقتباس. لا ترفع هذا الملف على GitHub عام وهو يحوي أسرارًا. */
 const LOCAL = {
-  BOT_TOKEN: '',                 // ← ضع هنا توكن البوت من BotFather
-  MONGODB_URI: '',               // ← ضع هنا رابط MongoDB Atlas
+  BOT_TOKEN: '8910839410:AAF1nCNRTkLgoe2fyA5o2P_5pMo-meSCoCo',
+  MONGODB_URI: 'mongodb+srv://mohamedfoutani10k_db_user:dakos2004@moneybuxdb.q4kojcz.mongodb.net/?retryWrites=true&w=majority',
   BOT_USERNAME: 'dakoslayer_bot',// ← اسم البوت بدون @ (عدّله إن كان مختلفًا)
   ADMIN_EMAIL: 'admin@dakos.app',
   ADMIN_PASSWORD: 'x6CCgHhA1NH6mdXv',
