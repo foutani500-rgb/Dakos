@@ -44,8 +44,10 @@ const LOCAL = {
   ADMIN_PASSWORD: 'x6CCgHhA1NH6mdXv',
   ADMIN_SECRET: '02c040b6593755bda3032f750f65d8cefe200366959783dcb55c173328c45d8b',
   TELEGRAM_WEBHOOK_SECRET: 'dakos_wh_7f3a9c1e5b2d4086',
-  FRONTEND_URL: '',              // ← رابط الواجهة (https://...) لزر فتح التطبيق في رسائل البوت
-  MINI_APP_NAME: ''
+  FRONTEND_URL: 'https://glistening-shortbread-e55027.netlify.app',   // ← رابط الواجهة (https://...) لزر فتح التطبيق في رسائل البوت
+  MINI_APP_NAME: '',
+  CHANNEL_URL: 'https://t.me/DakosSlayer',        // ← زر «اشترك في قناتنا» في رسالة /start (اتركه فارغًا لإخفائه)
+  GROUP_URL: 'https://t.me/dakoslayergroup'       // ← زر «انضم لمجموعتنا» في رسالة /start (اتركه فارغًا لإخفائه)
 };
 const env = (k, d = '') => String(process.env[k] || LOCAL[k] || d).trim();
 
@@ -314,17 +316,31 @@ async function registerAccount(db, tg, settings, startCode) {
 
 /* ============================== رسائل البوت ============================== */
 const BOT_TEXT = {
-  ar: { hello: (n) => `أهلاً ${n} 👋\nاضغط الزر لفتح DAKOS SLAYER وشاهد أحدث المسلسلات.`, open: 'فتح التطبيق 🎬', joined: (g) => `🎉 انضم صديق جديد عبر رابطك وحصلت على ${g} ذهب.` },
-  en: { hello: (n) => `Welcome ${n} 👋\nTap the button to open DAKOS SLAYER and watch the latest series.`, open: 'Open the app 🎬', joined: (g) => `🎉 A new friend joined through your link — you earned ${g} gold.` },
-  fr: { hello: (n) => `Bienvenue ${n} 👋\nAppuyez sur le bouton pour ouvrir DAKOS SLAYER.`, open: 'Ouvrir l’app 🎬', joined: (g) => `🎉 Un nouvel ami a rejoint via votre lien — vous gagnez ${g} or.` }
+  ar: {
+    hello: (n) => `أهلاً ${n} 👋\nاضغط الزر لفتح DAKOS SLAYER وشاهد أحدث المسلسلات.`, open: 'فتح التطبيق 🎬', joined: (g) => `🎉 انضم صديق جديد عبر رابطك وحصلت على ${g} ذهب.`,
+    // رسالة الترحيب الكاملة لأمر /start (من ملف البوت القديم) — تُستخدم بدل hello للعربية
+    welcome: `✅ مرحبا بكم في تطبيق Dakos Slayer اكبر مكتبة في التلجرام لمشاهدة المسلسلات التركية مترجمة ومدبلجة مجانا وباعلى جودة انزل للاسفل واضغط على " اضغط هنا للمشاهدة" واستمتع 👋🔥`,
+    openWatch: '🎬 اضغط هنا للمشاهدة', channelBtn: 'اشترك في قناتنا 💎', groupBtn: 'انضم لمجموعتنا على تلجرام 💡'
+  },
+  en: {
+    hello: (n) => `Welcome ${n} 👋\nTap the button to open DAKOS SLAYER and watch the latest series.`, open: 'Open the app 🎬', joined: (g) => `🎉 A new friend joined through your link — you earned ${g} gold.`,
+    channelBtn: 'Join our channel 💎', groupBtn: 'Join our Telegram group 💡'
+  },
+  fr: {
+    hello: (n) => `Bienvenue ${n} 👋\nAppuyez sur le bouton pour ouvrir DAKOS SLAYER.`, open: 'Ouvrir l’app 🎬', joined: (g) => `🎉 Un nouvel ami a rejoint via votre lien — vous gagnez ${g} or.`,
+    channelBtn: 'Rejoindre notre chaîne 💎', groupBtn: 'Rejoindre notre groupe Telegram 💡'
+  }
 };
 const botLang = (code) => { const c = String(code || '').slice(0, 2).toLowerCase(); return BOT_TEXT[c] ? c : 'ar'; };
-async function botSend(chatId, text, buttonText) {
+async function botSend(chatId, text, buttonText, extraRows = []) {
   const token = env('BOT_TOKEN');
   if (!token) return;
   const body = { chat_id: chatId, text };
   const web = env('FRONTEND_URL');
-  if (buttonText && /^https:\/\//i.test(web)) body.reply_markup = { inline_keyboard: [[{ text: buttonText, web_app: { url: web } }]] };
+  const rows = [];
+  if (buttonText && /^https:\/\//i.test(web)) rows.push([{ text: buttonText, web_app: { url: web } }]);
+  for (const r of extraRows) rows.push(r);   // أزرار روابط إضافية (القناة والمجموعة)
+  if (rows.length) body.reply_markup = { inline_keyboard: rows };
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(6000)
@@ -519,7 +535,11 @@ app.post('/api/telegram/webhook', h(async (req, res) => {
 
   const reg = existing ? { created: false, inviter: null } : await registerAccount(db, from, settings, m[1] || '');
   const t = BOT_TEXT[botLang(from.language_code)];
-  const sends = [botSend(from.id, t.hello(clean(from.first_name, 60) || ''), t.open)];
+  // أزرار القناة والمجموعة (تظهر فقط إن كانت الروابط https صحيحة)
+  const linkRows = [];
+  if (/^https:\/\//i.test(env('CHANNEL_URL'))) linkRows.push([{ text: t.channelBtn, url: env('CHANNEL_URL') }]);
+  if (/^https:\/\//i.test(env('GROUP_URL'))) linkRows.push([{ text: t.groupBtn, url: env('GROUP_URL') }]);
+  const sends = [botSend(from.id, t.welcome || t.hello(clean(from.first_name, 60) || ''), t.openWatch || t.open, linkRows)];
   if (reg.inviter) sends.push(botSend(reg.inviter._id, BOT_TEXT[botLang(reg.inviter.language_code)].joined(settings.referralGold)));
   await Promise.allSettled(sends);
   res.json({ ok: true });
