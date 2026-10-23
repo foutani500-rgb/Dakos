@@ -34,7 +34,20 @@ class HttpError extends Error {
 }
 const fail = (status, code, message) => { throw new HttpError(status, code, message); };
 const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-const env = (k, d = '') => String(process.env[k] ?? d).trim();
+/* ====== القيم المضمّنة (تُستخدم فقط إن لم يُضبط المتغير في Vercel؛ متغيرات Vercel لها الأولوية) ======
+ * عبّئ BOT_TOKEN و MONGODB_URI بين علامتي الاقتباس. لا ترفع هذا الملف على GitHub عام وهو يحوي أسرارًا. */
+const LOCAL = {
+  BOT_TOKEN: '',                 // ← ضع هنا توكن البوت من BotFather
+  MONGODB_URI: '',               // ← ضع هنا رابط MongoDB Atlas
+  BOT_USERNAME: 'dakoslayer_bot',// ← اسم البوت بدون @ (عدّله إن كان مختلفًا)
+  ADMIN_EMAIL: 'admin@dakos.app',
+  ADMIN_PASSWORD: 'x6CCgHhA1NH6mdXv',
+  ADMIN_SECRET: '02c040b6593755bda3032f750f65d8cefe200366959783dcb55c173328c45d8b',
+  TELEGRAM_WEBHOOK_SECRET: 'dakos_wh_7f3a9c1e5b2d4086',
+  FRONTEND_URL: '',              // ← رابط الواجهة (https://...) لزر فتح التطبيق في رسائل البوت
+  MINI_APP_NAME: ''
+};
+const env = (k, d = '') => String(process.env[k] || LOCAL[k] || d).trim();
 
 const clean = (v, max) => (typeof v === 'string' || typeof v === 'number') ? String(v).trim().slice(0, max) : '';
 const int = (v, min, max, label = 'القيمة') => {
