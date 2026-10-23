@@ -16,6 +16,8 @@ const LOGIN_MAX_TRIES = 5;                // محاولات الدخول الف�
 const LOGIN_WINDOW = 15 * 60 * 1000;      // ... خلال 15 دقيقة
 const HISTORY_MAX = 100;                  // آخر سجل عمليات يُحفظ لكل مستخدم
 const PAGE_SIZE = 20;
+const PROMO_MAX_TRIES = 10;               // محاولات إدخال كود برومو لكل مستخدم
+const PROMO_RE = /^[A-Z0-9_-]{3,24}$/;
 
 const DEFAULT_SETTINGS = { price: 100, welcomeGold: 100, referralGold: 100, dailyGold: 20, channelGold: 50, channel: '' };
 
@@ -25,6 +27,7 @@ const MSG = {
   no_account: 'لا يوجد حساب.', banned: 'هذا الحساب محظور.', insufficient: 'رصيدك من الذهب غير كافٍ.',
   no_link: 'لا يوجد رابط لهذه الحلقة بعد.', daily_wait: 'المكافأة اليومية غير متاحة الآن.', task_done: 'تم استلام هذه المكافأة سابقًا.',
   not_member: 'لم يتم التحقق من اشتراكك في القناة.', channel_off: 'مهمة القناة غير مفعّلة.', channel_check: 'تعذّر التحقق من القناة الآن.',
+  promo_invalid: 'كود البرومو غير صحيح.', promo_used: 'استخدمت هذا الكود سابقًا.', promo_exhausted: 'انتهت صلاحية الكود: استُنفد عدد المستفيدين.', promo_exists: 'هذا الكود موجود مسبقًا.',
   admin_auth: 'بيانات الدخول غير صحيحة.', rate_limited: 'محاولات كثيرة، حاول لاحقًا.', error: 'خطأ داخلي في الخادم.'
 };
 
@@ -514,6 +517,47 @@ app.post('/api/tasks/claim', userAuth, h(async (req, res) => {
   res.json({ profile: profileOf(r), reward });
 }));
 
+/* ---------- أكواد البرومو: استخدام الكود من قِبل المستخدم ---------- */
+app.post('/api/promo/redeem', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const users = db.collection('users');
+  const promos = db.collection('promos');
+  const user = await activeUser(db, req.tg.id);
+
+  // حدّ للمحاولات حتى لا يُخمَّن الكود بالتجربة المتكررة
+  const attempt = await loginAttempt(db.collection('ratelimit'), `promo:${user._id}`);
+  if (attempt.count > PROMO_MAX_TRIES) fail(429, 'rate_limited');
+
+  const code = clean(req.body && req.body.code, 40).toUpperCase();
+  if (!PROMO_RE.test(code)) fail(404, 'promo_invalid');
+
+  // 1) حجز مقعد في الكود ذريًا: لم يستخدمه هذا المستخدم من قبل، وعدد المستخدمين أقل من الحد الأقصى
+  const promo = await promos.findOneAndUpdate(
+    { _id: code, redeemedBy: { $ne: user._id }, $expr: { $lt: [{ $ifNull: ['$used', 0] }, '$maxUses'] } },
+    { $inc: { used: 1 }, $addToSet: { redeemedBy: user._id } },
+    { returnDocument: 'after' }
+  );
+  if (!promo) {
+    const p = await promos.findOne({ _id: code }, { projection: { redeemedBy: 1, used: 1, maxUses: 1 } });
+    if (!p) fail(404, 'promo_invalid');
+    if ((p.redeemedBy || []).includes(user._id)) fail(409, 'promo_used');
+    fail(410, 'promo_exhausted');
+  }
+
+  // 2) إضافة الذهب للمستخدم؛ إن فشلت (حساب حُذف/حُظر في اللحظة نفسها) يُرجَع المقعد المحجوز
+  const reward = promo.perUser;
+  const r = await users.findOneAndUpdate(
+    { _id: user._id, banned: { $ne: true } },
+    { $inc: { gold: reward }, $push: { history: pushHistory({ type: 'promo', amount: reward, note: code }) } },
+    { returnDocument: 'after' }
+  );
+  if (!r) {
+    await promos.updateOne({ _id: code }, { $inc: { used: -1 }, $pull: { redeemedBy: user._id } });
+    fail(403, 'banned');
+  }
+  res.json({ profile: profileOf(r), reward });
+}));
+
 /* ======================================================================
    بوت Telegram (Webhook): عند ضغط Start من رابط الإحالة  t.me/BOT?start=CODE
    ====================================================================== */
@@ -807,6 +851,42 @@ app.delete('/api/admin/stories', h(async (req, res) => {
   if (!id) fail(400, 'bad_request');
   const r = await db.collection('stories').deleteOne({ _id: id });
   res.json({ deleted: r.deletedCount > 0 });
+}));
+
+/* ---------- أكواد البرومو (المشرف) ---------- */
+app.get('/api/admin/promos', h(async (req, res) => {
+  const db = await getDb();
+  const rows = await db.collection('promos').find({}).project({ redeemedBy: 0 }).sort({ createdAt: -1 }).limit(200).toArray();
+  res.json({
+    promos: rows.map((p) => ({
+      code: p._id, perUser: p.perUser, maxUses: p.maxUses, used: p.used || 0, totalGold: p.totalGold, createdAt: p.createdAt || 0
+    }))
+  });
+}));
+
+app.post('/api/admin/promos', h(async (req, res) => {
+  const db = await getDb();
+  const b = req.body || {};
+  const totalGold = int(b.totalGold, 1, 1e7, 'إجمالي الذهب');
+  const maxUses = int(b.maxUses, 1, 1e5, 'عدد المستفيدين');
+  // الحساب يتم في الخادم دائمًا (لا نثق بقيمة perUser القادمة من الواجهة): إجمالي الذهب ÷ عدد المستفيدين، بدون كسور
+  const perUser = Math.floor(totalGold / maxUses);
+  if (perUser < 1) fail(400, 'bad_request', 'نصيب كل شخص يجب ألا يقل عن 1 ذهب');
+  const code = b.code ? clean(b.code, 40).toUpperCase() : 'DK' + crypto.randomBytes(4).toString('hex').toUpperCase();
+  if (!PROMO_RE.test(code)) fail(400, 'bad_request', 'الكود يجب أن يكون 3 إلى 24 حرفًا (أحرف إنجليزية كبيرة وأرقام و - _ فقط)');
+  const doc = { _id: code, totalGold, maxUses, perUser, used: 0, redeemedBy: [], createdAt: Date.now() };
+  try { await db.collection('promos').insertOne(doc); }
+  catch (e) { if (e && e.code === 11000) fail(409, 'promo_exists'); throw e; }
+  res.json({ saved: true, promo: { code, perUser, maxUses, used: 0, totalGold, createdAt: doc.createdAt, leftover: totalGold - perUser * maxUses } });
+}));
+
+app.delete('/api/admin/promos', h(async (req, res) => {
+  const db = await getDb();
+  const code = clean(req.body && req.body.code, 40).toUpperCase();
+  if (!PROMO_RE.test(code)) fail(400, 'bad_request');
+  const r = await db.collection('promos').deleteOne({ _id: code });
+  if (!r.deletedCount) fail(404, 'not_found');
+  res.json({ deleted: true });
 }));
 
 /* ---------- الإعدادات ---------- */
