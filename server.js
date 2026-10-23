@@ -220,7 +220,8 @@ const userName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') ||
 const publicUser = (u) => ({ id: u._id, first_name: u.first_name || '', username: u.username || '', language_code: u.language_code || '', photo_url: u.photo_url || '' });
 const profileOf = (u) => ({
   gold: u.gold || 0, friends: u.friends || 0, referralGold: u.referralGold || 0, referralCode: String(u._id),
-  unlocked: u.unlocked || {}, history: [...(u.history || [])].reverse().slice(0, 50), nextDailyAt: u.nextDailyAt || 0
+  unlocked: u.unlocked || {}, history: [...(u.history || [])].reverse().slice(0, 50), nextDailyAt: u.nextDailyAt || 0,
+  channelClaimed: !!u.channelClaimed
 });
 const adminRow = (u) => ({
   id: u._id, name: userName(u), username: u.username || '', gold: u.gold || 0, unlocked: u.unlockCount || 0,
