@@ -98,6 +98,7 @@ async function ensureIndexes(db) {
     await Promise.all([
       db.collection('users').createIndex({ referralCode: 1 }, { unique: true, sparse: true }),
       db.collection('users').createIndex({ createdAt: -1 }),
+      db.collection('users').createIndex({ referredBy: 1, createdAt: -1 }, { sparse: true }),
       db.collection('episodes').createIndex({ seriesId: 1, episode: 1 }, { unique: true }),
       db.collection('stories').createIndex({ seriesId: 1 }),
       db.collection('ratelimit').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 })
@@ -213,7 +214,7 @@ async function loginAttempt(rl, ip) {
 const userName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || u.username || String(u._id);
 const publicUser = (u) => ({ id: u._id, first_name: u.first_name || '', username: u.username || '', language_code: u.language_code || '', photo_url: u.photo_url || '' });
 const profileOf = (u) => ({
-  gold: u.gold || 0, friends: u.friends || 0, referralGold: u.referralGold || 0, referralCode: u.referralCode || '',
+  gold: u.gold || 0, friends: u.friends || 0, referralGold: u.referralGold || 0, referralCode: String(u._id),
   unlocked: u.unlocked || {}, history: [...(u.history || [])].reverse().slice(0, 50), nextDailyAt: u.nextDailyAt || 0
 });
 const adminRow = (u) => ({
@@ -267,6 +268,19 @@ const tgFields = (tg) => ({
   language_code: clean(tg.language_code, 10), photo_url: clean(tg.photo_url, 500)
 });
 const REF_CODE_RE = /^[A-Za-z0-9_-]{4,40}$/;
+/** يتحقق من صاحب رابط الإحالة: الكود هو معرّف Telegram الرقمي (ويدعم الأكواد القديمة العشوائية). يجب أن يكون الحساب موجودًا وغير محظور. */
+async function findInviter(users, code) {
+  const c = String(code || '').trim();
+  if (!REF_CODE_RE.test(c)) return null;
+  if (/^\d{4,15}$/.test(c)) {
+    const id = Number(c);
+    if (Number.isSafeInteger(id)) {
+      const byId = await users.findOne({ _id: id, banned: { $ne: true } });
+      if (byId) return byId;
+    }
+  }
+  return users.findOne({ referralCode: c, banned: { $ne: true } });
+}
 
 /**
  * ينشئ الحساب مرة واحدة فقط (upsert ذرّي)، وعند الإنشاء الفعلي فقط تُحتسب الإحالة لصاحب الرابط.
@@ -278,20 +292,20 @@ async function registerAccount(db, tg, settings, startCode) {
   const welcome = settings.welcomeGold;
   const r = await users.updateOne({ _id: tg.id }, {
     $setOnInsert: {
-      ...tgFields(tg), gold: welcome, friends: 0, referralGold: 0, referralCode: newCode(), unlocked: {}, views: 0, unlockCount: 0,
+      ...tgFields(tg), gold: welcome, friends: 0, referralGold: 0, referralCode: String(tg.id), unlocked: {}, views: 0, unlockCount: 0,
       banned: false, createdAt: now, lastSeen: now, history: welcome > 0 ? [{ type: 'welcome', amount: welcome, at: now }] : []
     }
   }, { upsert: true });
   const created = r.upsertedCount > 0;
   let inviter = null;
   if (created && REF_CODE_RE.test(startCode || '')) {
-    const found = await users.findOne({ referralCode: startCode, banned: { $ne: true } });
+    const found = await findInviter(users, startCode);
     if (found && found._id !== tg.id) {
       await users.updateOne({ _id: found._id }, {
         $inc: { gold: settings.referralGold, friends: 1, referralGold: settings.referralGold },
         $push: { history: pushHistory({ type: 'referral', amount: settings.referralGold }) }
       });
-      await users.updateOne({ _id: tg.id }, { $set: { referredBy: found._id } });
+      await users.updateOne({ _id: tg.id }, { $set: { referredBy: found._id, referralReward: settings.referralGold } });
       inviter = found;
     }
   }
@@ -390,6 +404,25 @@ app.get('/api/user/profile', userAuth, h(async (req, res) => {
     doc = await users.findOne({ _id: tg.id });
   }
   res.json({ user: publicUser(doc), profile: profileOf(doc), config: publicConfig(settings) });
+}));
+
+/* قائمة الأصدقاء الذين دعاهم المستخدم + المكافأة التي نالها من كل صديق */
+app.get('/api/user/referrals', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const users = db.collection('users');
+  const me = await activeUser(db, req.tg.id);
+  const settings = await getSettings(db);
+  const rows = await users.find({ referredBy: me._id })
+    .project({ first_name: 1, last_name: 1, username: 1, photo_url: 1, createdAt: 1, referralReward: 1 })
+    .sort({ createdAt: -1 }).limit(200).toArray();
+  const friends = rows.map((u) => ({
+    name: [u.first_name, u.last_name].filter(Boolean).join(' ') || u.username || 'User',
+    username: u.username || '',
+    photo_url: u.photo_url || '',
+    at: u.createdAt || 0,
+    gold: Number.isFinite(u.referralReward) ? u.referralReward : settings.referralGold
+  }));
+  res.json({ success: true, friends, total: me.friends || friends.length, referralGold: me.referralGold || 0 });
 }));
 
 app.post('/api/episodes/watch', userAuth, h(async (req, res) => {
@@ -492,6 +525,25 @@ app.post('/api/telegram/webhook', h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* تسجيل الـ Webhook للبوت بضغطة واحدة: افتح في المتصفح
+   https://<دومين-الخادم>/api/telegram/setup?key=<TELEGRAM_WEBHOOK_SECRET> */
+app.get('/api/telegram/setup', h(async (req, res) => {
+  const secret = env('TELEGRAM_WEBHOOK_SECRET');
+  const token = env('BOT_TOKEN');
+  if (!secret || !token) fail(500, 'config', 'TELEGRAM_WEBHOOK_SECRET أو BOT_TOKEN غير مضبوط');
+  if (!safeEqHex(String(req.query.key || ''), secret)) fail(403, 'bad_session', 'مفتاح غير صحيح');
+  const host = req.get('x-forwarded-host') || req.get('host');
+  const url = `https://${host}/api/telegram/webhook`;
+  const r = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, secret_token: secret, allowed_updates: ['message'], drop_pending_updates: true }),
+    signal: AbortSignal.timeout(8000)
+  }).then((x) => x.json()).catch(() => ({ ok: false, description: 'network' }));
+  const info = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`, { signal: AbortSignal.timeout(8000) })
+    .then((x) => x.json()).catch(() => null);
+  res.json({ success: !!r.ok, webhook_url: url, telegram: r, info: info && info.result ? { url: info.result.url, pending: info.result.pending_update_count, last_error: info.result.last_error_message || null } : null });
+}));
+
 /* ======================================================================
    المشرف
    ====================================================================== */
@@ -563,7 +615,7 @@ app.get('/api/admin/users', h(async (req, res) => {
     const tmap = Object.fromEntries(titles.map((t) => [t._id, t.title]));
     return res.json({
       user: {
-        ...adminRow(u), referralCode: u.referralCode || '',
+        ...adminRow(u), referralCode: String(u._id),
         watched: ids.map((k) => ({ seriesId: k, title: tmap[k] || k, episodes: [...u.unlocked[k]].sort((x, y) => x - y) })),
         history: [...(u.history || [])].reverse()
       }
