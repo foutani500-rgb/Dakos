@@ -18,8 +18,12 @@ const HISTORY_MAX = 100;                  // آخر سجل عمليات يُحف
 const PAGE_SIZE = 20;
 const PROMO_MAX_TRIES = 10;               // محاولات إدخال كود برومو لكل مستخدم
 const PROMO_RE = /^[A-Z0-9_-]{3,24}$/;
+const AD_DAILY_LIMIT = 50;                // الحد اليومي للإعلانات لكل مستخدم
+const AD_COOLDOWN_MS = 60 * 1000;         // مؤقت بين إعلان وآخر (دقيقة)
+const AD_MIN_WATCH_MS = 8000;             // أقل زمن بين بدء الإعلان واستلام مكافأته (وضع بدون Postback)
+const TICKET_RE = /^[a-f0-9]{8,40}$/;
 
-const DEFAULT_SETTINGS = { price: 100, welcomeGold: 100, referralGold: 100, dailyGold: 20, channelGold: 50, channel: '' };
+const DEFAULT_SETTINGS = { price: 100, welcomeGold: 100, referralGold: 100, dailyGold: 20, channelGold: 50, adGold: 20, channel: '' };
 
 const MSG = {
   bad_request: 'طلب غير صالح.', not_found: 'غير موجود.', config: 'الخدمة غير مُهيأة بعد.',
@@ -28,6 +32,7 @@ const MSG = {
   no_link: 'لا يوجد رابط لهذه الحلقة بعد.', daily_wait: 'المكافأة اليومية غير متاحة الآن.', task_done: 'تم استلام هذه المكافأة سابقًا.',
   not_member: 'لم يتم التحقق من اشتراكك في القناة.', channel_off: 'مهمة القناة غير مفعّلة.', channel_check: 'تعذّر التحقق من القناة الآن.',
   promo_invalid: 'كود البرومو غير صحيح.', promo_used: 'استخدمت هذا الكود سابقًا.', promo_exhausted: 'انتهت صلاحية الكود: استُنفد عدد المستفيدين.', promo_exists: 'هذا الكود موجود مسبقًا.',
+  ad_limit: 'وصلت للحد اليومي للإعلانات (50). يتجدد بعد 24 ساعة من أول إعلان.', ad_wait: 'لم تكتمل مشاهدة الإعلان بعد.', ad_cooldown: 'انتظر قليلًا قبل مشاهدة الإعلان التالي.', ad_invalid: 'جلسة الإعلان غير صالحة.',
   admin_auth: 'بيانات الدخول غير صحيحة.', rate_limited: 'محاولات كثيرة، حاول لاحقًا.', error: 'خطأ داخلي في الخادم.'
 };
 
@@ -50,7 +55,9 @@ const LOCAL = {
   FRONTEND_URL: 'https://glistening-shortbread-e55027.netlify.app',   // ← رابط الواجهة (https://...) لزر فتح التطبيق في رسائل البوت
   MINI_APP_NAME: '',
   CHANNEL_URL: 'https://t.me/DakosSlayer',        // ← زر «اشترك في قناتنا» في رسالة /start (اتركه فارغًا لإخفائه)
-  GROUP_URL: 'https://t.me/dakoslayergroup'       // ← زر «انضم لمجموعتنا» في رسالة /start (اتركه فارغًا لإخفائه)
+  GROUP_URL: 'https://t.me/dakoslayergroup',      // ← زر «انضم لمجموعتنا» في رسالة /start (اتركه فارغًا لإخفائه)
+  MONETAG_ZONE: '12109806',                       // ← معرّف Zone في Monetag (Rewarded Interstitial)
+  MONETAG_POSTBACK_SECRET: ''                     // ← سر الـ Postback: إن عُبّئ يُمنح الذهب فقط بعد تأكيد Monetag من الخادم (الأكثر أمانًا)
 };
 const env = (k, d = '') => String(process.env[k] || LOCAL[k] || d).trim();
 
@@ -106,7 +113,8 @@ async function ensureIndexes(db) {
       db.collection('users').createIndex({ referredBy: 1, createdAt: -1 }, { sparse: true }),
       db.collection('episodes').createIndex({ seriesId: 1, episode: 1 }, { unique: true }),
       db.collection('stories').createIndex({ seriesId: 1 }),
-      db.collection('ratelimit').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 })
+      db.collection('ratelimit').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
+      db.collection('ads').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 })
     ]);
   } catch (e) { console.error('index error', e.message); }
 }
@@ -118,6 +126,7 @@ async function getSettings(db) {
 }
 const publicConfig = (s) => ({
   price: s.price, dailyGold: s.dailyGold, channelGold: s.channelGold, referralGold: s.referralGold,
+  adGold: s.adGold, adDailyLimit: AD_DAILY_LIMIT, adCooldownSec: AD_COOLDOWN_MS / 1000, adZone: env('MONETAG_ZONE', '12109806'),
   botUsername: env('BOT_USERNAME', 'dakoslayer_bot').replace(/^@/, ''), miniAppName: env('MINI_APP_NAME'), channel: s.channel
 });
 
@@ -218,10 +227,14 @@ async function loginAttempt(rl, ip) {
 /* ============================== مساعدات البيانات ============================== */
 const userName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || u.username || String(u._id);
 const publicUser = (u) => ({ id: u._id, first_name: u.first_name || '', username: u.username || '', language_code: u.language_code || '', photo_url: u.photo_url || '' });
+// نافذة الإعلانات اليومية: تبدأ عند أول إعلان وتنتهي بعد 24 ساعة، ثم يبدأ العدّاد من الصفر
+const adsLive = (u, now = Date.now()) => !!(u && u.adsResetAt && u.adsResetAt > now);
 const profileOf = (u) => ({
   gold: u.gold || 0, friends: u.friends || 0, referralGold: u.referralGold || 0, referralCode: String(u._id),
   unlocked: u.unlocked || {}, history: [...(u.history || [])].reverse().slice(0, 50), nextDailyAt: u.nextDailyAt || 0,
-  channelClaimed: !!u.channelClaimed
+  channelClaimed: !!u.channelClaimed,
+  adsToday: adsLive(u) ? (u.adsCount || 0) : 0, adsLimit: AD_DAILY_LIMIT, adsResetAt: adsLive(u) ? u.adsResetAt : 0,
+  adsNextAt: (u.adsNextAt && u.adsNextAt > Date.now()) ? u.adsNextAt : 0
 });
 const adminRow = (u) => ({
   id: u._id, name: userName(u), username: u.username || '', gold: u.gold || 0, unlocked: u.unlockCount || 0,
@@ -557,6 +570,99 @@ app.post('/api/promo/redeem', userAuth, h(async (req, res) => {
     fail(403, 'banned');
   }
   res.json({ profile: profileOf(r), reward });
+}));
+
+/* ======================================================================
+   إعلانات Monetag (Rewarded Interstitial)
+   الحد اليومي AD_DAILY_LIMIT يتجدد بعد 24 ساعة من أول إعلان في النافذة.
+   التدفق: start (تذكرة) ← عرض الإعلان في الواجهة ← claim (أو Postback من Monetag).
+   كل تذكرة تُستعمل مرة واحدة، والعدّ وإضافة الذهب في عملية ذرّية واحدة فلا يمكن تجاوز الحد.
+   ====================================================================== */
+const adsViaPostback = () => !!env('MONETAG_POSTBACK_SECRET');
+
+async function creditAd(db, userId, reward) {
+  const now = Date.now();
+  return db.collection('users').findOneAndUpdate(
+    // يمرّ فقط إن كانت النافذة منتهية (تبدأ نافذة جديدة) أو لم يبلغ العدّاد الحد
+    { _id: userId, banned: { $ne: true }, adsNextAt: { $not: { $gt: now } }, $or: [{ adsResetAt: { $not: { $gt: now } } }, { adsCount: { $lt: AD_DAILY_LIMIT } }] },
+    [
+      { $set: { _live: { $gt: [{ $ifNull: ['$adsResetAt', 0] }, now] } } },
+      { $set: {
+        adsCount: { $add: [{ $cond: ['$_live', { $ifNull: ['$adsCount', 0] }, 0] }, 1] },
+        adsResetAt: { $cond: ['$_live', '$adsResetAt', now + DAY] },
+        adsNextAt: now + AD_COOLDOWN_MS,
+        adsTotal: { $add: [{ $ifNull: ['$adsTotal', 0] }, 1] },
+        gold: { $add: [{ $ifNull: ['$gold', 0] }, reward] },
+        history: { $slice: [{ $concatArrays: [{ $ifNull: ['$history', []] }, [{ type: 'task_ad', amount: reward, at: now }]] }, -HISTORY_MAX] }
+      } },
+      { $unset: '_live' }
+    ],
+    { returnDocument: 'after' }
+  );
+}
+
+/** يُغلق التذكرة (مرة واحدة فقط) ثم يمنح المكافأة. يرجع null إن كانت التذكرة مستعملة أو غير موجودة. */
+async function finishAd(db, ticketId, userId) {
+  const ads = db.collection('ads');
+  const t = await ads.findOneAndUpdate(
+    { _id: ticketId, userId, status: 'pending' },
+    { $set: { status: 'done', doneAt: Date.now() } },
+    { returnDocument: 'after' }
+  );
+  if (!t) return null;
+  const r = await creditAd(db, userId, t.reward || 0);
+  if (!r) {
+    await ads.updateOne({ _id: ticketId }, { $set: { status: 'rejected' } });
+    const u = await db.collection('users').findOne({ _id: userId }, { projection: { adsResetAt: 1, adsCount: 1 } });
+    fail(429, adsLive(u) && (u.adsCount || 0) >= AD_DAILY_LIMIT ? 'ad_limit' : 'ad_cooldown');
+  }
+  return { profile: profileOf(r), reward: t.reward || 0 };
+}
+
+app.post('/api/ads/start', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const user = await activeUser(db, req.tg.id);
+  const now = Date.now();
+  if (adsLive(user, now) && (user.adsCount || 0) >= AD_DAILY_LIMIT) fail(429, 'ad_limit');
+  if (user.adsNextAt && user.adsNextAt > now) fail(429, 'ad_cooldown');
+  const reward = (await getSettings(db)).adGold;
+  const ticket = crypto.randomBytes(12).toString('hex');
+  await db.collection('ads').insertOne({ _id: ticket, userId: user._id, status: 'pending', reward, createdAt: now, expireAt: new Date(now + DAY) });
+  res.json({ ticket, ymid: String(user._id), reward, profile: profileOf(user) });
+}));
+
+app.post('/api/ads/claim', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const user = await activeUser(db, req.tg.id);
+  const ticket = clean(req.body && req.body.ticket, 40);
+  if (!TICKET_RE.test(ticket)) fail(400, 'bad_request');
+  const t = await db.collection('ads').findOne({ _id: ticket, userId: user._id });
+  if (!t) fail(404, 'ad_invalid');
+  if (t.status === 'rejected') fail(429, 'ad_limit');
+  if (t.status === 'done') return res.json({ pending: false, profile: profileOf(user), reward: t.reward || 0 });
+  // وضع Postback: الذهب يُمنح من تأكيد Monetag فقط، والواجهة تستعلم عن الحالة
+  if (adsViaPostback()) return res.json({ pending: true, profile: profileOf(user), reward: t.reward || 0 });
+  // بدون Postback: نشترط مرور زمن معقول منذ بدء الإعلان
+  if (Date.now() - t.createdAt < AD_MIN_WATCH_MS) fail(429, 'ad_wait');
+  const r = await finishAd(db, ticket, user._id);
+  if (!r) return res.json({ pending: false, profile: profileOf(await activeUser(db, user._id)), reward: t.reward || 0 });   // سباق طلبين
+  res.json({ pending: false, ...r });
+}));
+
+/* Postback من Monetag (GET). عيّن في لوحة Monetag الرابط:
+   https://<دومين-الخادم>/api/ads/postback?secret=<MONETAG_POSTBACK_SECRET>&ymid={ymid}&request_var={request_var}&reward_event_type={reward_event_type}
+   (طابق أسماء المتغيرات داخل {} مع ما تعرضه لوحة Monetag) */
+app.get('/api/ads/postback', h(async (req, res) => {
+  const secret = env('MONETAG_POSTBACK_SECRET');
+  if (!secret) fail(500, 'config', 'MONETAG_POSTBACK_SECRET غير مضبوط');
+  if (!safeEqHex(String(req.query.secret || ''), secret)) fail(403, 'bad_session', 'مفتاح غير صحيح');
+  const type = String(req.query.reward_event_type || 'valued').toLowerCase();
+  const ticket = clean(req.query.request_var || req.query.requestVar, 40);
+  const uid = Number(req.query.ymid);
+  if (type !== 'valued' || !TICKET_RE.test(ticket) || !Number.isSafeInteger(uid)) return res.send('ignored');
+  const db = await getDb();
+  try { await finishAd(db, ticket, uid); } catch (e) { if (!(e instanceof HttpError)) throw e; }
+  res.send('ok');
 }));
 
 /* ======================================================================
@@ -899,7 +1005,7 @@ app.post('/api/admin/settings', h(async (req, res) => {
   const db = await getDb();
   const b = req.body || {};
   const next = await getSettings(db);
-  for (const k of ['price', 'welcomeGold', 'referralGold', 'dailyGold', 'channelGold']) {
+  for (const k of ['price', 'welcomeGold', 'referralGold', 'dailyGold', 'channelGold', 'adGold']) {
     if (b[k] !== undefined) next[k] = int(b[k], 0, 1e6, k);
   }
   if (b.channel !== undefined) {
