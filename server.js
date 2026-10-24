@@ -413,7 +413,7 @@ app.get('/api/catalog', h(async (req, res) => {
   res.json({
     series: series.map((s) => ({
       id: s._id, title: s.title, category: s.category, year: s.year, rating: s.rating, image: s.image, tag: s.tag,
-      description: s.description, episodes: s.episodes, i18n: s.i18n || {}, linked: linked[s._id] || []
+      description: s.description, episodes: s.episodes, i18n: s.i18n || {}, views: s.views || 0, createdAt: s.createdAt || 0, linked: linked[s._id] || []
     })),
     stories: stories.map((s) => ({ id: s._id, title: s.title, image: s.image, text: s.text || '', seriesId: s.seriesId || '' })),
     config: publicConfig(settings)
