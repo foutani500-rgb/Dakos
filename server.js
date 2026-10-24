@@ -6,7 +6,7 @@
  */
 const express = require('express');
 const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
 /* ============================== الثوابت ============================== */
 const DAY = 24 * 60 * 60 * 1000;
@@ -114,7 +114,9 @@ async function ensureIndexes(db) {
       db.collection('episodes').createIndex({ seriesId: 1, episode: 1 }, { unique: true }),
       db.collection('stories').createIndex({ seriesId: 1 }),
       db.collection('ratelimit').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
-      db.collection('ads').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 })
+      db.collection('ads').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
+      db.collection('notifications').createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
+      db.collection('notifications').createIndex({ createdAt: -1 })
     ]);
   } catch (e) { console.error('index error', e.message); }
 }
@@ -262,6 +264,102 @@ async function linkedMap(db, match = {}) {
     { $match: match }, { $sort: { episode: 1 } }, { $group: { _id: '$seriesId', eps: { $push: '$episode' } } }
   ]).toArray();
   return Object.fromEntries(rows.map((r) => [r._id, r.eps]));
+}
+
+/* ---------- الإشعارات: مسلسل جديد / حلقة جديدة ---------- */
+const NOTIF_TTL = 30 * DAY;
+async function addNotification(db, doc) {
+  try {
+    const now = Date.now();
+    const r = await db.collection('notifications').insertOne({ ...doc, createdAt: now, expireAt: new Date(now + NOTIF_TTL) });
+    return r.insertedId;
+  } catch (e) { console.error('notification error', e.message); return null; }   // لا نُفشل حفظ المسلسل/الحلقة بسبب الإشعار
+}
+const newPush = () => (env('BOT_TOKEN') ? { lastId: 0, sent: 0, blocked: 0, failed: 0, done: false, lockUntil: 0 } : null);
+
+/* ---------- الإرسال عبر البوت (دفعات، لأن الخادم على Vercel بمهلة قصيرة) ---------- */
+const PUSH_TEXT = {
+  ar: { series: (t) => `🎬 تمت إضافة مسلسل جديد: ${t}`, ep: (n, t) => `📺 تمت إضافة الحلقة ${n} من ${t}`, eps: (n, t) => `📺 تمت إضافة ${n} ${n <= 10 ? 'حلقات' : 'حلقة'} جديدة من ${t}`, open: 'شاهد الآن 🎬' },
+  en: { series: (t) => `🎬 New series added: ${t}`, ep: (n, t) => `📺 Episode ${n} of ${t} is now available`, eps: (n, t) => `📺 ${n} new episodes of ${t} added`, open: 'Watch now 🎬' },
+  fr: { series: (t) => `🎬 Nouvelle série ajoutée : ${t}`, ep: (n, t) => `📺 Épisode ${n} de ${t} ajouté`, eps: (n, t) => `📺 ${n} nouveaux épisodes de ${t} ajoutés`, open: 'Regarder 🎬' }
+};
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const pushLink = (n) => {
+  const web = env('FRONTEND_URL');
+  if (!/^https:\/\//i.test(web)) return '';
+  try {
+    const x = new URL(web);
+    x.searchParams.set('nsid', n.seriesId);
+    if (n.type === 'episode' && (n.count || 1) === 1) x.searchParams.set('nep', String(n.episode));
+    return x.toString();
+  } catch { return ''; }
+};
+/** يرسل رسالة واحدة لمستخدم: 'ok' | 'limit' (429) | 'blocked' | 'fail' */
+async function pushOne(db, token, u, n, s, link) {
+  const lang = botLang(u.language_code);
+  const T = PUSH_TEXT[lang];
+  const title = (s.i18n && s.i18n[lang] && s.i18n[lang].title) || s.title;
+  const text = n.type === 'episode' ? ((n.count || 1) > 1 ? T.eps(n.count, title) : T.ep(n.episode, title)) : T.series(title);
+  const body = { chat_id: u._id, text };
+  if (link) body.reply_markup = { inline_keyboard: [[{ text: T.open, web_app: { url: link } }]] };
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000)
+    });
+    if (r.ok) return 'ok';
+    if (r.status === 429) return 'limit';
+    const j = await r.json().catch(() => ({}));
+    // لم يضغط Start أو حظر البوت: لا نعيد المحاولة معه لاحقًا (يُرفع الحظر تلقائيًا عند ضغطه Start)
+    if (r.status === 403 || /chat not found|deactivated/i.test(String(j && j.description))) {
+      await db.collection('users').updateOne({ _id: u._id }, { $set: { botBlocked: true } });
+      return 'blocked';
+    }
+    return 'fail';
+  } catch { return 'fail'; }
+}
+/** يرسل دفعة ضمن مهلة زمنية ثم يحفظ التقدّم؛ يُستدعى مرارًا حتى done=true */
+async function pushStep(db, id) {
+  const col = db.collection('notifications');
+  const token = env('BOT_TOKEN');
+  const t0 = Date.now();
+  const budget = Math.max(3000, Number(env('PUSH_BUDGET_MS', '7500')) || 7500);
+  const snap = (n) => ({ id: String(n._id), sent: n.push.sent, blocked: n.push.blocked, failed: n.push.failed, done: !!n.push.done });
+  const n0 = await col.findOne({ _id: id });
+  if (!n0 || !n0.push) return { id: String(id), sent: 0, blocked: 0, failed: 0, done: true };
+  if (n0.push.done) return snap(n0);
+  if (!token) return { ...snap(n0), done: true };
+  // قفل ذرّي لمنع تشغيلين متوازيين وتكرار الرسائل
+  const lock = await col.updateOne({ _id: id, 'push.done': { $ne: true }, 'push.lockUntil': { $lt: t0 } }, { $set: { 'push.lockUntil': t0 + budget + 4000 } });
+  if (!lock.matchedCount) return { ...snap(n0), busy: true };
+  const n = await col.findOne({ _id: id });
+  const s = await db.collection('series').findOne({ _id: n.seriesId }, { projection: { title: 1, i18n: 1 } });
+  let { lastId, sent, blocked, failed } = n.push;
+  let done = !s;                                   // المسلسل حُذف: لا داعي للإرسال
+  const link = pushLink(n);
+  while (!done && Date.now() - t0 < budget - 1500) {
+    const batch = await db.collection('users')
+      .find({ _id: { $gt: lastId }, banned: { $ne: true }, botBlocked: { $ne: true } })
+      .sort({ _id: 1 }).limit(25).project({ language_code: 1 }).toArray();
+    if (!batch.length) { done = true; break; }
+    const tick = Date.now();
+    const res = await Promise.all(batch.map((u) => pushOne(db, token, u, n, s, link)));
+    const li = res.indexOf('limit');                // حدّ Telegram: نتوقف ونكمل في الاستدعاء التالي
+    const upto = li >= 0 ? li : batch.length;
+    for (let i = 0; i < upto; i++) { if (res[i] === 'ok') sent++; else if (res[i] === 'blocked') blocked++; else failed++; }
+    if (upto) lastId = batch[upto - 1]._id;
+    if (li >= 0) break;
+    const wait = 1050 - (Date.now() - tick);        // أقل من 30 رسالة في الثانية
+    if (wait > 0) await sleepMs(wait);
+  }
+  await col.updateOne({ _id: id }, { $set: { push: { lastId, sent, blocked, failed, done, lockUntil: 0 } } });
+  return { id: String(id), sent, blocked, failed, done };
+}
+/** أرقام عمليات bulkWrite التي أنشأت حلقة جديدة فعلًا (وليست تحديث رابط قديم) */
+function upsertedIndexes(r) {
+  const u = r && (r.upsertedIds || (typeof r.getUpsertedIds === 'function' ? r.getUpsertedIds() : null));
+  if (!u) return [];
+  if (Array.isArray(u)) return u.map((x) => Number(x.index));
+  return Object.keys(u).map(Number);
 }
 
 async function assertChannelMember(channel, userId) {
@@ -417,6 +515,24 @@ app.get('/api/catalog', h(async (req, res) => {
     })),
     stories: stories.map((s) => ({ id: s._id, title: s.title, image: s.image, text: s.text || '', seriesId: s.seriesId || '' })),
     config: publicConfig(settings)
+  });
+}));
+
+app.get('/api/notifications', h(async (req, res) => {
+  const db = await getDb();
+  const rows = await db.collection('notifications').find({}).sort({ createdAt: -1 }).limit(30).toArray();
+  const ids = [...new Set(rows.map((r) => r.seriesId))];
+  const list = ids.length ? await db.collection('series').find({ _id: { $in: ids } }).project({ title: 1, image: 1, i18n: 1 }).toArray() : [];
+  const map = new Map(list.map((x) => [x._id, x]));
+  res.json({
+    now: Date.now(),
+    notifications: rows.filter((r) => map.has(r.seriesId)).map((r) => {
+      const x = map.get(r.seriesId);
+      return {
+        id: String(r._id), type: r.type, seriesId: r.seriesId, episode: r.episode || 0, count: r.count || 1,
+        createdAt: r.createdAt, title: x.title, image: x.image, i18n: x.i18n || {}
+      };
+    })
   });
 }));
 
@@ -683,6 +799,7 @@ app.post('/api/telegram/webhook', h(async (req, res) => {
   const settings = await getSettings(db);
   const existing = await db.collection('users').findOne({ _id: from.id }, { projection: { banned: 1 } });
   if (existing && existing.banned) return res.json({ ok: true });
+  if (existing) await db.collection('users').updateOne({ _id: from.id }, { $unset: { botBlocked: 1 } });   // ضغط Start: يمكن مراسلته
 
   const reg = existing ? { created: false, inviter: null } : await registerAccount(db, from, settings, m[1] || '');
   const t = BOT_TEXT[botLang(from.language_code)];
@@ -713,6 +830,14 @@ app.get('/api/telegram/setup', h(async (req, res) => {
   const info = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`, { signal: AbortSignal.timeout(8000) })
     .then((x) => x.json()).catch(() => null);
   res.json({ success: !!r.ok, webhook_url: url, telegram: r, info: info && info.result ? { url: info.result.url, pending: info.result.pending_update_count, last_error: info.result.last_error_message || null } : null });
+}));
+
+app.get('/api/cron/push', h(async (req, res) => {
+  const secret = env('TELEGRAM_WEBHOOK_SECRET');
+  if (!secret || !safeEqHex(String(req.query.key || ''), secret)) fail(403, 'bad_session', 'مفتاح غير صحيح');
+  const db = await getDb();
+  const n = await db.collection('notifications').findOne({ 'push.done': false }, { sort: { createdAt: 1 }, projection: { _id: 1 } });
+  res.json(n ? await pushStep(db, n._id) : { idle: true });
 }));
 
 /* ======================================================================
@@ -876,8 +1001,10 @@ app.post('/api/admin/series', h(async (req, res) => {
     image: httpUrl(b.image, 'رابط الصورة', true), tag: clean(b.tag, 40), description: clean(b.description, 3000),
     episodes: int(b.episodes, 1, 2000, 'عدد الحلقات'), i18n: cleanI18n(b.i18n)
   };
-  await db.collection('series').updateOne({ _id: id }, { $set: fields, $setOnInsert: { views: 0, createdAt: Date.now() } }, { upsert: true });
-  res.json({ saved: true, id });
+  const r = await db.collection('series').updateOne({ _id: id }, { $set: fields, $setOnInsert: { views: 0, createdAt: Date.now() } }, { upsert: true });
+  let nid = null;
+  if (r.upsertedCount && b.notify !== false) nid = await addNotification(db, { type: 'series', seriesId: id, push: b.push !== false ? newPush() : null });
+  res.json({ saved: true, id, notification: nid && b.push !== false && env('BOT_TOKEN') ? String(nid) : undefined });
 }));
 
 app.delete('/api/admin/series', h(async (req, res) => {
@@ -885,7 +1012,7 @@ app.delete('/api/admin/series', h(async (req, res) => {
   const id = sid(req.body && req.body.id);
   const r = await db.collection('series').deleteOne({ _id: id });
   if (!r.deletedCount) fail(404, 'not_found');
-  await Promise.all([db.collection('episodes').deleteMany({ seriesId: id }), db.collection('stories').deleteMany({ seriesId: id })]);
+  await Promise.all([db.collection('episodes').deleteMany({ seriesId: id }), db.collection('stories').deleteMany({ seriesId: id }), db.collection('notifications').deleteMany({ seriesId: id })]);
   res.json({ deleted: true });
 }));
 
@@ -908,8 +1035,14 @@ app.post('/api/admin/episodes', h(async (req, res) => {
   } else {                                                  // حلقة واحدة
     push(int(b.episode, 1, 5000, 'رقم الحلقة'), b.watchUrl, 'رابط الحلقة');
   }
-  await db.collection('episodes').bulkWrite(ops, { ordered: false });
-  res.json({ saved: ops.length });
+  const bw = await db.collection('episodes').bulkWrite(ops, { ordered: false });
+  let nid = null;
+  if (b.notify !== false) {
+    // فقط الحلقات التي أُنشئت لأول مرة؛ استبدال رابط حلقة موجودة لا يرسل إشعارًا
+    const fresh = upsertedIndexes(bw).map((i) => ops[i] && ops[i].updateOne.filter.episode).filter(Boolean).sort((x, y) => x - y);
+    if (fresh.length) nid = await addNotification(db, { type: 'episode', seriesId, episode: fresh[0], episodeTo: fresh[fresh.length - 1], count: fresh.length, push: b.push !== false ? newPush() : null });
+  }
+  res.json({ saved: ops.length, notification: nid && b.push !== false && env('BOT_TOKEN') ? String(nid) : undefined });
 }));
 
 app.delete('/api/admin/episodes', h(async (req, res) => {
@@ -918,6 +1051,14 @@ app.delete('/api/admin/episodes', h(async (req, res) => {
   const episode = int(req.body && req.body.episode, 1, 5000, 'رقم الحلقة');
   const r = await db.collection('episodes').deleteOne({ seriesId, episode });
   res.json({ deleted: r.deletedCount > 0 });
+}));
+
+/* ---------- إرسال الإشعار عبر البوت (تستدعيه لوحة الأدمن مرارًا حتى done) ---------- */
+app.post('/api/admin/notifications/push', h(async (req, res) => {
+  const db = await getDb();
+  const raw = String((req.body && req.body.id) || '');
+  if (!ObjectId.isValid(raw)) fail(400, 'bad_request', 'معرّف الإشعار غير صالح');
+  res.json(await pushStep(db, new ObjectId(raw)));
 }));
 
 /* ---------- القصص ---------- */
