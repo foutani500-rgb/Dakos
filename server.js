@@ -234,7 +234,7 @@ const adsLive = (u, now = Date.now()) => !!(u && u.adsResetAt && u.adsResetAt > 
 const profileOf = (u) => ({
   gold: u.gold || 0, friends: u.friends || 0, referralGold: u.referralGold || 0, referralCode: String(u._id),
   unlocked: u.unlocked || {}, history: [...(u.history || [])].reverse().slice(0, 50), nextDailyAt: u.nextDailyAt || 0,
-  channelClaimed: !!u.channelClaimed,
+  channelClaimed: !!u.channelClaimed, botNotify: u.botNotify !== false, ratings: u.ratings || {},
   adsToday: adsLive(u) ? (u.adsCount || 0) : 0, adsLimit: AD_DAILY_LIMIT, adsResetAt: adsLive(u) ? u.adsResetAt : 0,
   adsNextAt: (u.adsNextAt && u.adsNextAt > Date.now()) ? u.adsNextAt : 0
 });
@@ -255,9 +255,10 @@ function cleanI18n(v) {
   }
   return out;
 }
+const starDist = (s) => [1, 2, 3, 4, 5].map((k) => Math.max(0, Number(s && s.rs && s.rs[k]) || 0));
 const adminSeries = (s, linked) => ({
   id: s._id, title: s.title, category: s.category, year: s.year, rating: s.rating, image: s.image, tag: s.tag,
-  description: s.description, episodes: s.episodes, i18n: s.i18n || {}, views: s.views || 0, linked: linked || []
+  description: s.description, episodes: s.episodes, i18n: s.i18n || {}, views: s.views || 0, linked: linked || [], votes: starDist(s)
 });
 async function linkedMap(db, match = {}) {
   const rows = await db.collection('episodes').aggregate([
@@ -338,7 +339,7 @@ async function pushStep(db, id) {
   const link = pushLink(n);
   while (!done && Date.now() - t0 < budget - 1500) {
     const batch = await db.collection('users')
-      .find({ _id: { $gt: lastId }, banned: { $ne: true }, botBlocked: { $ne: true } })
+      .find({ _id: { $gt: lastId }, banned: { $ne: true }, botBlocked: { $ne: true }, botNotify: { $ne: false } })
       .sort({ _id: 1 }).limit(25).project({ language_code: 1 }).toArray();
     if (!batch.length) { done = true; break; }
     const tick = Date.now();
@@ -511,7 +512,8 @@ app.get('/api/catalog', h(async (req, res) => {
   res.json({
     series: series.map((s) => ({
       id: s._id, title: s.title, category: s.category, year: s.year, rating: s.rating, image: s.image, tag: s.tag,
-      description: s.description, episodes: s.episodes, i18n: s.i18n || {}, views: s.views || 0, createdAt: s.createdAt || 0, linked: linked[s._id] || []
+      description: s.description, episodes: s.episodes, i18n: s.i18n || {}, views: s.views || 0, createdAt: s.createdAt || 0, linked: linked[s._id] || [],
+      votes: starDist(s)
     })),
     stories: stories.map((s) => ({ id: s._id, title: s.title, image: s.image, text: s.text || '', seriesId: s.seriesId || '' })),
     config: publicConfig(settings)
@@ -553,6 +555,39 @@ app.get('/api/user/profile', userAuth, h(async (req, res) => {
     doc = await users.findOne({ _id: tg.id });
   }
   res.json({ user: publicUser(doc), profile: profileOf(doc), config: publicConfig(settings) });
+}));
+
+/* إعدادات المستخدم: تشغيل/إيقاف إشعارات البوت */
+app.post('/api/user/settings', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const me = await activeUser(db, req.tg.id);
+  const botNotify = !(req.body && req.body.botNotify === false);
+  await db.collection('users').updateOne({ _id: me._id }, { $set: { botNotify } });
+  res.json({ success: true, botNotify });
+}));
+
+/* تقييم مسلسل بالنجوم (1-5): لكل مستخدم تقييم واحد لكل مسلسل ويمكنه تعديله */
+app.post('/api/series/rate', userAuth, h(async (req, res) => {
+  const db = await getDb();
+  const me = await activeUser(db, req.tg.id);
+  const b = req.body || {};
+  const seriesId = clean(b.seriesId, 40);
+  if (!ID_RE.test(seriesId)) fail(400, 'bad_request', 'المسلسل غير صالح');
+  const stars = int(b.stars, 1, 5, 'التقييم');
+  if (!(await db.collection('series').findOne({ _id: seriesId }, { projection: { _id: 1 } }))) fail(404, 'not_found', 'المسلسل غير موجود');
+  const key = `ratings.${seriesId}`;
+  const prev = Number(me.ratings && me.ratings[seriesId]) || 0;
+  if (prev !== stars) {
+    // شرط على القيمة السابقة يمنع احتساب صوت مزدوج عند ضغطتين متزامنتين
+    const w = await db.collection('users').updateOne({ _id: me._id, [key]: prev || { $exists: false } }, { $set: { [key]: stars } });
+    if (w.matchedCount) {
+      const inc = { [`rs.${stars}`]: 1 };
+      if (prev) inc[`rs.${prev}`] = -1;
+      await db.collection('series').updateOne({ _id: seriesId }, { $inc: inc });
+    }
+  }
+  const cur = await db.collection('series').findOne({ _id: seriesId }, { projection: { rs: 1 } });
+  res.json({ success: true, stars, votes: starDist(cur) });
 }));
 
 /* قائمة الأصدقاء الذين دعاهم المستخدم + المكافأة التي نالها من كل صديق */
@@ -872,7 +907,9 @@ app.get('/api/admin/stats', h(async (req, res) => {
   const db = await getDb();
   const now = Date.now();
   const startToday = new Date(); startToday.setUTCHours(0, 0, 0, 0);
-  const [u, s, linkedCount, top] = await Promise.all([
+  const since = startToday.getTime() - 13 * DAY;
+  const perDay = (field) => [{ $match: { [field]: { $gte: since } } }, { $group: { _id: { $floor: { $divide: [{ $subtract: [`$${field}`, since] }, DAY] } }, n: { $sum: 1 } } }];
+  const [u, s, linkedCount, top, nd, ad, rt] = await Promise.all([
     db.collection('users').aggregate([{
       $group: {
         _id: null, users: { $sum: 1 },
@@ -884,15 +921,21 @@ app.get('/api/admin/stats', h(async (req, res) => {
     }]).toArray(),
     db.collection('series').aggregate([{ $group: { _id: null, series: { $sum: 1 }, episodes: { $sum: '$episodes' } } }]).toArray(),
     db.collection('episodes').countDocuments({}),
-    db.collection('series').find({ views: { $gt: 0 } }).sort({ views: -1 }).limit(5).toArray()
+    db.collection('series').find({ views: { $gt: 0 } }).sort({ views: -1 }).limit(5).toArray(),
+    db.collection('users').aggregate(perDay('createdAt')).toArray(),
+    db.collection('users').aggregate(perDay('lastSeen')).toArray(),
+    db.collection('series').aggregate([{ $group: { _id: null, n: { $sum: { $add: [{ $ifNull: ['$rs.1', 0] }, { $ifNull: ['$rs.2', 0] }, { $ifNull: ['$rs.3', 0] }, { $ifNull: ['$rs.4', 0] }, { $ifNull: ['$rs.5', 0] }] } } } }]).toArray()
   ]);
+  const dayRow = (rows, i) => (rows.find((r) => r._id === i) || {}).n || 0;
+  const daily = Array.from({ length: 14 }, (_, i) => ({ d: since + i * DAY, newUsers: dayRow(nd, i), active: dayRow(ad, i) }));
   const a = u[0] || {}, b = s[0] || {};
   res.json({
     stats: {
       series: b.series || 0, episodes: b.episodes || 0, episodesLinked: linkedCount,
       users: a.users || 0, banned: a.banned || 0, newToday: a.newToday || 0, activeToday: a.activeToday || 0,
-      gold: a.gold || 0, views: a.views || 0, unlocks: a.unlocks || 0
+      gold: a.gold || 0, views: a.views || 0, unlocks: a.unlocks || 0, ratings: (rt[0] && rt[0].n) || 0
     },
+    daily,
     top: top.map((x) => ({ id: x._id, title: x.title, views: x.views || 0 }))
   });
 }));
@@ -1051,6 +1094,29 @@ app.delete('/api/admin/episodes', h(async (req, res) => {
   const episode = int(req.body && req.body.episode, 1, 5000, 'رقم الحلقة');
   const r = await db.collection('episodes').deleteOne({ seriesId, episode });
   res.json({ deleted: r.deletedCount > 0 });
+}));
+
+/* ---------- سجل الإشعارات المرسلة (لوحة الأدمن) ---------- */
+app.get('/api/admin/notifications', h(async (req, res) => {
+  const db = await getDb();
+  const rows = await db.collection('notifications').find({}).sort({ createdAt: -1 }).limit(50).toArray();
+  const ids = [...new Set(rows.map((r) => r.seriesId))];
+  const list = ids.length ? await db.collection('series').find({ _id: { $in: ids } }).project({ title: 1 }).toArray() : [];
+  const map = new Map(list.map((x) => [x._id, x.title]));
+  res.json({
+    notifications: rows.map((r) => ({
+      id: String(r._id), type: r.type, seriesId: r.seriesId, title: map.get(r.seriesId) || r.seriesId, missing: !map.has(r.seriesId),
+      episode: r.episode || 0, episodeTo: r.episodeTo || r.episode || 0, count: r.count || 1, createdAt: r.createdAt,
+      push: r.push ? { sent: r.push.sent || 0, blocked: r.push.blocked || 0, failed: r.push.failed || 0, done: !!r.push.done } : null
+    }))
+  });
+}));
+app.delete('/api/admin/notifications', h(async (req, res) => {
+  const db = await getDb();
+  const raw = String((req.body && req.body.id) || '');
+  if (!ObjectId.isValid(raw)) fail(400, 'bad_request', 'معرّف الإشعار غير صالح');
+  await db.collection('notifications').deleteOne({ _id: new ObjectId(raw) });
+  res.json({ deleted: true });
 }));
 
 /* ---------- إرسال الإشعار عبر البوت (تستدعيه لوحة الأدمن مرارًا حتى done) ---------- */
