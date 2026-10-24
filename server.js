@@ -53,7 +53,7 @@ const LOCAL = {
   ADMIN_SECRET: '02c040b6593755bda3032f750f65d8cefe200366959783dcb55c173328c45d8b',
   TELEGRAM_WEBHOOK_SECRET: 'dakos_wh_7f3a9c1e5b2d4086',
   FRONTEND_URL: 'https://glistening-shortbread-e55027.netlify.app',   // ← رابط الواجهة (https://...) لزر فتح التطبيق في رسائل البوت
-  MINI_APP_NAME: '',
+  MINI_APP_NAME: 'player',
   CHANNEL_URL: 'https://t.me/DakosSlayer',        // ← زر «اشترك في قناتنا» في رسالة /start (اتركه فارغًا لإخفائه)
   GROUP_URL: 'https://t.me/dakoslayergroup',      // ← زر «انضم لمجموعتنا» في رسالة /start (اتركه فارغًا لإخفائه)
   MONETAG_ZONE: '12109806',                       // ← معرّف Zone في Monetag (Rewarded Interstitial)
